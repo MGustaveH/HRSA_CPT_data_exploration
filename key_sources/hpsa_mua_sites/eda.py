@@ -117,3 +117,24 @@ data = data.sort_values(by="hpsa_name")
 data.to_csv("data_columns_dropped.csv", index=False)
 
 data['hpsa_name'].value_counts(dropna=False)
+
+# make a function which checks to see if two columns' values have a one to one mapping even
+def check_one_to_one_mapping(col1, col2):
+    return col1.value_counts().sort_index().values.tolist() == col2.value_counts().sort_index().values.tolist()
+
+# check for duplicative columns
+for col in data.columns:
+    duplicate_columns = []
+    for col2 in data.columns:
+        if col != col2 and col not in duplicate_columns and col2 not in duplicate_columns:
+            if check_one_to_one_mapping(data[col], data[col2]):
+                duplicate_columns.append(col2)
+    if len(duplicate_columns) > 0:
+        print(f"Column {col} has {len(duplicate_columns)} duplicate columns: {duplicate_columns}")
+    else:
+        print(f"Column {col} has no duplicate columns")
+
+# remove ['primary_state_abbreviation', 'common_state_abbreviation', 'primary_state_fips_code', 'common_state_fips_code', 'primary_state_name', 'common_state_name']
+data = data.drop(columns = ['primary_state_abbreviation', 'common_state_abbreviation', 'primary_state_fips_code', 'common_state_fips_code', 'primary_state_name', 'common_state_name'])
+len(data.columns)
+
