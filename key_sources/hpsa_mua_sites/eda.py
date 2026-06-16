@@ -1,6 +1,6 @@
 """
-Exploratory analysis of HRSA Primary Care HPSA detail data
-(BCD_HPSA_FCT_DET_PC.xlsx).
+Exploratory analysis of HRSA HPSA detail data across occupational domains
+(Primary Care, Dental Health, Mental Health).
 
 Each row is a geographic *component* of an HPSA designation. Area-based
 designations (Population, Geographic, High Needs Geographic) span many rows —
@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -30,28 +31,100 @@ except ImportError:
     HAS_GEOPANDAS = False
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths and domain configuration
 # ---------------------------------------------------------------------------
-DATA_PATH = Path(
+HPSA_BASE = Path(
     "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
     "/My Drive/CesarK_CPT_project/data/key_data_sources/data_samples"
-    "/HPSA MUAP Sites/HPSA – Primary Care/BCD_HPSA_FCT_DET_PC.xlsx"
+    "/HPSA MUAP Sites"
 )
 OUTPUT_DIR = Path(__file__).parent / "output"
 PILOT_SITES_PATH = Path(
     "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
     "/My Drive/CesarK_CPT_project/data/community_health_center_pilot_sites.xlsx"
 )
-BOUNDARIES_DIR = Path(
-    "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
-    "/My Drive/CesarK_CPT_project/data/key_data_sources/data_samples"
-    "/HPSA MUAP Sites/boundaries"
-)
-AREA_COMPONENT_BOUNDARIES_SHP = (
-    BOUNDARIES_DIR / "area_hpsa_component_boundaries/HPSA_CMPPC_SHP_DET_CUR_VX.shp"
-)
-FACILITY_HPSAS_SHP = BOUNDARIES_DIR / "all_facility_hpsas/HPSA_PNTPC_SHP_DET_CUR_VX.shp"
 FACILITY_MATCH_MAX_DISTANCE_M = 150
+
+# HRSA layer prefixes: CMP = component polygons, PNT = facility points, PLY = designation polygons.
+HPSA_DOMAINS: dict[str, dict[str, str]] = {
+    "primary_care": {
+        "label": "Primary Care",
+        "folder": "HPSA – Primary Care",
+        "detail_file": "BCD_HPSA_FCT_DET_PC.xlsx",
+        "discipline_class": "Primary Care",
+    },
+    "dental": {
+        "label": "Dental Health",
+        "folder": "HPSA – Dental Health",
+        "detail_file": "BCD_HPSA_FCT_DET_DH.xlsx",
+        "discipline_class": "Dental Health",
+    },
+    "mental_health": {
+        "label": "Mental Health",
+        "folder": "HPSA – Mental Health",
+        "detail_file": "BCD_HPSA_FCT_DET_MH.xlsx",
+        "discipline_class": "Mental Health",
+    },
+}
+
+
+@dataclass
+class HPSADomainPaths:
+    key: str
+    label: str
+    discipline_class: str
+    detail_xlsx: Path
+    boundaries_dir: Path
+    area_component_shp: Path | None
+    facility_shp: Path | None
+
+
+@dataclass
+class HPSADomainAssets:
+    paths: HPSADomainPaths
+    designated: pd.DataFrame
+    sites: pd.DataFrame
+    geography: pd.DataFrame
+    tract_lookup: pd.DataFrame
+    county_lookup: pd.DataFrame
+    county_subdivision_lookup: pd.DataFrame
+    facility_sites: pd.DataFrame
+    area_boundaries: "gpd.GeoDataFrame | None" = None
+    facility_boundaries: "gpd.GeoDataFrame | None" = None
+
+
+def find_boundary_shp(boundaries_dir: Path, layer_prefix: str) -> Path | None:
+    """
+    Locate an HRSA boundary shapefile by layer prefix.
+
+    Matches HRSA naming such as HPSA_CMPPC_SHP_DET_CUR_VX.shp (component),
+    HPSA_PNTDH_SHP_DET_CUR_VX.shp (facility), HPSA_PLYMH_SHP_DET_CUR_VX.shp (designation).
+    """
+    if not boundaries_dir.exists():
+        return None
+    matches = sorted(boundaries_dir.rglob(f"HPSA_{layer_prefix}*_DET_CUR_VX.shp"))
+    return matches[0] if matches else None
+
+
+def get_domain_paths(domain_key: str) -> HPSADomainPaths:
+    """Resolve spreadsheet and boundary paths for one HPSA occupational domain."""
+    if domain_key not in HPSA_DOMAINS:
+        raise KeyError(
+            f"Unknown domain {domain_key!r}. Expected one of {list(HPSA_DOMAINS)}."
+        )
+
+    cfg = HPSA_DOMAINS[domain_key]
+    domain_dir = HPSA_BASE / cfg["folder"]
+    boundaries_dir = domain_dir / "boundaries"
+    return HPSADomainPaths(
+        key=domain_key,
+        label=cfg["label"],
+        discipline_class=cfg["discipline_class"],
+        detail_xlsx=domain_dir / cfg["detail_file"],
+        boundaries_dir=boundaries_dir,
+        area_component_shp=find_boundary_shp(boundaries_dir, "CMP"),
+        facility_shp=find_boundary_shp(boundaries_dir, "PNT"),
+    )
 
 CENSUS_GEOCODER_URL = (
     "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
@@ -115,12 +188,71 @@ GEO_COLUMNS = [
 ]
 
 
-def load_designated_hpsa(path: Path = DATA_PATH) -> pd.DataFrame:
-    """Load the detail file and keep only Designated primary-care HPSAs."""
+def load_designated_hpsa(path: Path) -> pd.DataFrame:
+    """Load a domain detail file and keep only Designated HPSA records."""
     df = pd.read_excel(path)
     df.columns = df.columns.str.lower().str.replace(" ", "_")
     designated = df[df["hpsa_status"] == "Designated"].copy()
     return designated
+
+
+def build_domain_assets(
+    domain_key: str,
+    *,
+    load_boundaries: bool = True,
+) -> HPSADomainAssets:
+    """Load spreadsheets, lookup tables, and optional boundary layers for one domain."""
+    paths = get_domain_paths(domain_key)
+    if not paths.detail_xlsx.exists():
+        raise FileNotFoundError(f"Detail file not found: {paths.detail_xlsx}")
+
+    designated = load_designated_hpsa(paths.detail_xlsx)
+    sites = build_site_table(designated)
+    geography = build_geography_table(designated)
+
+    area_boundaries = None
+    facility_boundaries = None
+    if load_boundaries and HAS_GEOPANDAS:
+        if paths.area_component_shp and paths.area_component_shp.exists():
+            area_boundaries = load_area_hpsa_boundaries(
+                paths.area_component_shp, paths.discipline_class
+            )
+        if paths.facility_shp and paths.facility_shp.exists():
+            facility_boundaries = load_facility_hpsa_boundaries(
+                paths.facility_shp, paths.discipline_class
+            )
+
+    return HPSADomainAssets(
+        paths=paths,
+        designated=designated,
+        sites=sites,
+        geography=geography,
+        tract_lookup=build_tract_lookup(geography),
+        county_lookup=build_county_lookup(geography),
+        county_subdivision_lookup=build_county_subdivision_lookup(geography),
+        facility_sites=sites.loc[sites["is_facility_designation"]].copy(),
+        area_boundaries=area_boundaries,
+        facility_boundaries=facility_boundaries,
+    )
+
+
+def write_domain_outputs(assets: HPSADomainAssets, profile: dict) -> Path:
+    """Write per-domain CSV outputs and return the output directory."""
+    domain_out = OUTPUT_DIR / assets.paths.key
+    domain_out.mkdir(parents=True, exist_ok=True)
+
+    assets.sites.to_csv(domain_out / "hpsa_sites.csv", index=False)
+    assets.geography.to_csv(domain_out / "hpsa_geography.csv", index=False)
+    assets.tract_lookup.to_csv(domain_out / "hpsa_tract_lookup.csv", index=False)
+    assets.county_lookup.to_csv(domain_out / "hpsa_county_lookup.csv", index=False)
+    assets.county_subdivision_lookup.to_csv(
+        domain_out / "hpsa_county_subdivision_lookup.csv", index=False
+    )
+    profile["completeness"].to_csv(domain_out / "column_completeness.csv", index=False)
+    profile["designation_type_breakdown"].to_csv(
+        domain_out / "designation_type_breakdown.csv"
+    )
+    return domain_out
 
 
 def profile_dataset(df: pd.DataFrame) -> dict:
@@ -475,26 +607,28 @@ def _empty_hpsa_match() -> dict[str, list[Any]]:
 
 
 def load_area_hpsa_boundaries(
-    path: Path = AREA_COMPONENT_BOUNDARIES_SHP,
+    path: Path,
+    discipline_class: str,
 ) -> "gpd.GeoDataFrame":
-    """Load designated primary-care area HPSA component polygons."""
+    """Load designated area HPSA component polygons for one occupational domain."""
     if not HAS_GEOPANDAS:
         raise ImportError("geopandas is required for boundary-based HPSA checks")
     gdf = gpd.read_file(path)
     return gdf.loc[
-        (gdf["HpsStatCD"] == "D") & (gdf["DscpClsDes"] == "Primary Care")
+        (gdf["HpsStatCD"] == "D") & (gdf["DscpClsDes"] == discipline_class)
     ].copy()
 
 
 def load_facility_hpsa_boundaries(
-    path: Path = FACILITY_HPSAS_SHP,
+    path: Path,
+    discipline_class: str,
 ) -> "gpd.GeoDataFrame":
-    """Load designated primary-care facility HPSA point locations."""
+    """Load designated facility HPSA point locations for one occupational domain."""
     if not HAS_GEOPANDAS:
         raise ImportError("geopandas is required for boundary-based HPSA checks")
     gdf = gpd.read_file(path)
     return gdf.loc[
-        (gdf["HpsStatCD"] == "D") & (gdf["DscpClsDes"] == "Primary Care")
+        (gdf["HpsStatCD"] == "D") & (gdf["DscpClsDes"] == discipline_class)
     ].copy()
 
 
@@ -628,7 +762,7 @@ def check_address_in_hpsa(
     geocode_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
-    Determine whether an address falls within a designated primary-care HPSA.
+    Determine whether an address falls within a designated HPSA for one domain.
 
     Uses HRSA boundary shapefiles when provided (highest confidence). Otherwise
     falls back to geocoded tract/county lookup tables and spreadsheet facility
@@ -771,10 +905,65 @@ def check_addresses_in_hpsa(
     return pd.concat([addresses.reset_index(drop=True), result_df], axis=1)
 
 
-def print_profile_summary(profile: dict) -> None:
+def check_addresses_all_domains(
+    addresses: pd.DataFrame,
+    domain_assets: dict[str, HPSADomainAssets],
+) -> pd.DataFrame:
+    """
+    Geocode each address once, then check HPSA membership across all domains.
+
+    Returns a wide dataframe with per-domain ``in_hpsa_{domain_key}`` columns.
+    """
+    rows: list[dict[str, Any]] = []
+
+    for _, row in addresses.iterrows():
+        geo = geocode_address(row["address"], row["city"], row["state"], row["zip"])
+        record: dict[str, Any] = {
+            "address": row["address"],
+            "city": row["city"],
+            "state": row["state"],
+            "zip": row["zip"],
+            "geocode_success": geo.get("geocode_success"),
+            "geocode_matched_address": geo.get("geocode_matched_address"),
+            "census_tract_fips": geo.get("census_tract_fips"),
+            "county_fips": geo.get("county_fips"),
+            "latitude": geo.get("latitude"),
+            "longitude": geo.get("longitude"),
+        }
+
+        for domain_key, assets in domain_assets.items():
+            check = check_address_in_hpsa(
+                row["address"],
+                row["city"],
+                row["state"],
+                row["zip"],
+                tract_lookup=assets.tract_lookup,
+                county_lookup=assets.county_lookup,
+                county_subdivision_lookup=assets.county_subdivision_lookup,
+                facility_sites=assets.facility_sites,
+                area_boundaries=assets.area_boundaries,
+                facility_boundaries=assets.facility_boundaries,
+                geocode=False,
+                geocode_result=geo,
+            )
+            record[f"in_hpsa_{domain_key}"] = check["in_hpsa"]
+            record[f"in_hpsa_area_{domain_key}"] = check["in_hpsa_area"]
+            record[f"is_hpsa_facility_{domain_key}"] = check["is_hpsa_facility"]
+            record[f"matched_hpsa_names_{domain_key}"] = check["matched_hpsa_names"]
+            record[f"lookup_boundary_agree_{domain_key}"] = check["lookup_boundary_agree"]
+
+        record["in_hpsa_any"] = any(
+            record[f"in_hpsa_{domain_key}"] for domain_key in domain_assets
+        )
+        rows.append(record)
+
+    return pd.DataFrame(rows)
+
+
+def print_profile_summary(profile: dict, *, domain_label: str) -> None:
     """Print a human-readable summary to stdout."""
     print("=" * 72)
-    print("HPSA Primary Care — Designated records profile")
+    print(f"HPSA — {domain_label} (Designated records profile)")
     print("=" * 72)
     print(f"Detail rows (geography components): {profile['raw_rows']:,}")
     print(f"Unique HPSA designations (hpsa_id):  {profile['unique_sites']:,}")
@@ -839,118 +1028,91 @@ Caveats:
   - Tract lookup is fast and usually agrees with HRSA polygons; shapefiles are authoritative.
   - Area-based spreadsheet rows have no lat/lon; only facility rows do.
   - hpsa_name is not unique (7120 names vs 7666 ids); always key on hpsa_id.
-  - This file is Primary Care only; other discipline HPSAs are separate datasets.
+  - hpsa_id is not unique across domains; always include discipline/domain.
+  - This analysis supports Primary Care, Dental Health, and Mental Health separately.
 """
     )
 
 
-def print_pilot_site_results(results: pd.DataFrame) -> None:
-    """Print a concise summary of pilot-site HPSA checks."""
+def print_pilot_site_results(results: pd.DataFrame, domain_assets: dict[str, HPSADomainAssets]) -> None:
+    """Print a concise summary of pilot-site HPSA checks across all domains."""
     print()
     print("=" * 72)
-    print("Community health center pilot sites — HPSA checks")
+    print("Community health center pilot sites — HPSA checks (all domains)")
     print("=" * 72)
     print(f"Sites checked: {len(results)}")
-    print(f"In designated HPSA: {results['in_hpsa'].sum()}")
-    print(f"In HPSA area: {results['in_hpsa_area'].sum()}")
-    print(f"Direct HPSA facility match: {results['is_hpsa_facility'].sum()}")
+    print(f"In any designated HPSA: {results['in_hpsa_any'].sum()}")
     print(f"Geocode failures: {(~results['geocode_success']).sum()}")
+    print()
 
-    if results["used_boundary_layers"].any():
-        print(f"In HPSA area (tract/county lookup): {results['in_hpsa_area_lookup'].sum()}")
-        print(f"In HPSA area (HRSA polygons): {results['in_hpsa_area_boundary'].sum()}")
-        disagreements = results.loc[~results["lookup_boundary_agree"]]
-        print(f"Lookup vs boundary disagreements: {len(disagreements)}")
-        print("Match method: HRSA boundary shapefiles (area polygons + facility points)")
+    for domain_key, assets in domain_assets.items():
+        label = assets.paths.label
+        in_col = f"in_hpsa_{domain_key}"
+        area_col = f"in_hpsa_area_{domain_key}"
+        facility_col = f"is_hpsa_facility_{domain_key}"
+        agree_col = f"lookup_boundary_agree_{domain_key}"
+        print(f"{label}: {results[in_col].sum()} in HPSA ({results[area_col].sum()} area, {results[facility_col].sum()} facility)")
+        if agree_col in results.columns and results[agree_col].notna().any():
+            disagreements = results.loc[results[agree_col] == False]  # noqa: E712
+            print(f"  Lookup vs boundary disagreements: {len(disagreements)}")
 
     print()
-    display_cols = [
-        "address",
-        "city",
-        "zip",
-        "geocode_success",
-        "in_hpsa",
-        "in_hpsa_area",
-        "matched_hpsa_names",
-    ]
-    if results["used_boundary_layers"].any():
-        display_cols.extend(
-            ["in_hpsa_area_lookup", "in_hpsa_area_boundary", "lookup_boundary_agree"]
-        )
-    else:
-        display_cols.extend(["match_methods", "census_tract_fips"])
+    display_cols = ["address", "city", "zip", "geocode_success", "in_hpsa_any"]
+    for domain_key in domain_assets:
+        display_cols.append(f"in_hpsa_{domain_key}")
+    for domain_key in domain_assets:
+        display_cols.append(f"matched_hpsa_names_{domain_key}")
     print(results[display_cols].to_string(index=False))
 
 
 def main() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
 
-    df = load_designated_hpsa()
-    profile = profile_dataset(df)
-    print_profile_summary(profile)
+    if not HAS_GEOPANDAS:
+        print("Warning: geopandas not installed; boundary-based checks will be skipped.")
 
-    sites = build_site_table(df)
-    geography = build_geography_table(df)
-    tract_lookup = build_tract_lookup(geography)
-    county_lookup = build_county_lookup(geography)
-    county_subdivision_lookup = build_county_subdivision_lookup(geography)
-    facility_sites = sites.loc[sites["is_facility_designation"]].copy()
+    domain_assets: dict[str, HPSADomainAssets] = {}
 
-    sites.to_csv(OUTPUT_DIR / "hpsa_sites.csv", index=False)
-    geography.to_csv(OUTPUT_DIR / "hpsa_geography.csv", index=False)
-    tract_lookup.to_csv(OUTPUT_DIR / "hpsa_tract_lookup.csv", index=False)
-    county_lookup.to_csv(OUTPUT_DIR / "hpsa_county_lookup.csv", index=False)
-    county_subdivision_lookup.to_csv(
-        OUTPUT_DIR / "hpsa_county_subdivision_lookup.csv", index=False
-    )
-    profile["completeness"].to_csv(OUTPUT_DIR / "column_completeness.csv", index=False)
-    profile["designation_type_breakdown"].to_csv(
-        OUTPUT_DIR / "designation_type_breakdown.csv"
-    )
+    for domain_key in HPSA_DOMAINS:
+        print()
+        assets = build_domain_assets(domain_key, load_boundaries=HAS_GEOPANDAS)
+        domain_assets[domain_key] = assets
 
-    print()
-    print("Output tables written to:", OUTPUT_DIR)
-    print(f"  hpsa_sites.csv          — {len(sites):,} unique HPSA designations")
-    print(f"  hpsa_geography.csv      — {len(geography):,} geography components")
-    print(f"  hpsa_tract_lookup.csv   — {len(tract_lookup):,} census tracts with HPSA coverage")
-    print(f"  column_completeness.csv — null/unique stats for all columns")
+        profile = profile_dataset(assets.designated)
+        print_profile_summary(profile, domain_label=assets.paths.label)
 
-    # Sanity checks
-    assert sites[SITE_KEY].is_unique, "Site table must have one row per hpsa_id"
-    assert len(sites) == df[SITE_KEY].nunique()
-    assert geography.drop_duplicates(subset=[SITE_KEY, "geo_id"]).shape[0] == len(geography)
+        domain_out = write_domain_outputs(assets, profile)
+        print()
+        print(f"Output tables written to: {domain_out}")
+        print(f"  hpsa_sites.csv          — {len(assets.sites):,} unique HPSA designations")
+        print(f"  hpsa_geography.csv      — {len(assets.geography):,} geography components")
+        print(f"  hpsa_tract_lookup.csv   — {len(assets.tract_lookup):,} census tracts")
+
+        if assets.area_boundaries is not None:
+            facility_count = (
+                len(assets.facility_boundaries)
+                if assets.facility_boundaries is not None
+                else 0
+            )
+            print(
+                f"  Boundary layers loaded: {len(assets.area_boundaries):,} area polygons, "
+                f"{facility_count:,} facility points"
+            )
+        elif assets.paths.area_component_shp:
+            print(f"  Boundary shapefile found but not loaded: {assets.paths.area_component_shp.name}")
+        else:
+            print("  No component boundary shapefile (HPSA_CMP*_DET_CUR_VX.shp) found")
+
+        assert assets.sites[SITE_KEY].is_unique
+        assert len(assets.sites) == assets.designated[SITE_KEY].nunique()
 
     print_linking_guidance()
 
     if PILOT_SITES_PATH.exists():
         pilot_sites = load_pilot_sites(PILOT_SITES_PATH)
-
-        area_boundaries = None
-        facility_boundaries = None
-        if AREA_COMPONENT_BOUNDARIES_SHP.exists() and HAS_GEOPANDAS:
-            print()
-            print("Loading HRSA boundary shapefiles for point-in-polygon checks...")
-            area_boundaries = load_area_hpsa_boundaries()
-            print(f"  Area component polygons: {len(area_boundaries):,}")
-            if FACILITY_HPSAS_SHP.exists():
-                facility_boundaries = load_facility_hpsa_boundaries()
-                print(f"  Facility points: {len(facility_boundaries):,}")
-        elif AREA_COMPONENT_BOUNDARIES_SHP.exists() and not HAS_GEOPANDAS:
-            print()
-            print("Boundary shapefiles found but geopandas is not installed.")
-            print("Install geopandas to enable polygon-based HPSA checks.")
-
-        pilot_results = check_addresses_in_hpsa(
-            pilot_sites,
-            tract_lookup=tract_lookup,
-            county_lookup=county_lookup,
-            county_subdivision_lookup=county_subdivision_lookup,
-            facility_sites=facility_sites,
-            area_boundaries=area_boundaries,
-            facility_boundaries=facility_boundaries,
-        )
+        pilot_results = check_addresses_all_domains(pilot_sites, domain_assets)
         pilot_results.to_csv(OUTPUT_DIR / "pilot_sites_hpsa_check.csv", index=False)
-        print_pilot_site_results(pilot_results)
+        print_pilot_site_results(pilot_results, domain_assets)
         print()
         print("Pilot site results written to:", OUTPUT_DIR / "pilot_sites_hpsa_check.csv")
     else:
