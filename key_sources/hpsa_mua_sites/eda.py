@@ -10,9 +10,24 @@ one per census tract, county, or county subdivision. Facility-based designations
 
 from __future__ import annotations
 
+import json
+import re
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+
+try:
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    HAS_GEOPANDAS = True
+except ImportError:
+    HAS_GEOPANDAS = False
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -23,6 +38,27 @@ DATA_PATH = Path(
     "/HPSA MUAP Sites/HPSA – Primary Care/BCD_HPSA_FCT_DET_PC.xlsx"
 )
 OUTPUT_DIR = Path(__file__).parent / "output"
+PILOT_SITES_PATH = Path(
+    "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
+    "/My Drive/CesarK_CPT_project/data/community_health_center_pilot_sites.xlsx"
+)
+BOUNDARIES_DIR = Path(
+    "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
+    "/My Drive/CesarK_CPT_project/data/key_data_sources/data_samples"
+    "/HPSA MUAP Sites/boundaries"
+)
+AREA_COMPONENT_BOUNDARIES_SHP = (
+    BOUNDARIES_DIR / "area_hpsa_component_boundaries/HPSA_CMPPC_SHP_DET_CUR_VX.shp"
+)
+FACILITY_HPSAS_SHP = BOUNDARIES_DIR / "all_facility_hpsas/HPSA_PNTPC_SHP_DET_CUR_VX.shp"
+FACILITY_MATCH_MAX_DISTANCE_M = 150
+
+CENSUS_GEOCODER_URL = (
+    "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
+)
+GEOCODER_BENCHMARK = "Public_AR_Current"
+GEOCODER_VINTAGE = "Current_Current"
+GEOCODER_SLEEP_SECONDS = 0.25
 
 SITE_KEY = "hpsa_id"
 
@@ -200,20 +236,539 @@ def build_geography_table(df: pd.DataFrame) -> pd.DataFrame:
     return geo.sort_values([SITE_KEY, "hpsa_component_type_description", "geo_id"])
 
 
-def build_tract_lookup(geography: pd.DataFrame) -> pd.DataFrame:
-    """Tract FIPS → HPSA designations for joining external address/tract data."""
-    tract_rows = geography.dropna(subset=["census_tract_fips"]).copy()
-    lookup = (
-        tract_rows.groupby("census_tract_fips", as_index=False)
+def _aggregate_hpsa_lookup(geography: pd.DataFrame, geo_col: str) -> pd.DataFrame:
+    """Build a geo-id → HPSA designation lookup for one geography level."""
+    rows = geography.dropna(subset=[geo_col]).copy()
+    return (
+        rows.groupby(geo_col, as_index=False)
         .agg(
             n_hpsa_sites=(SITE_KEY, "nunique"),
             hpsa_ids=(SITE_KEY, lambda s: sorted(s.unique().tolist())),
             hpsa_names=("hpsa_name", lambda s: sorted(s.unique().tolist())),
             designation_types=("designation_type", lambda s: sorted(s.unique().tolist())),
         )
-        .sort_values("census_tract_fips")
+        .sort_values(geo_col)
     )
-    return lookup
+
+
+def build_tract_lookup(geography: pd.DataFrame) -> pd.DataFrame:
+    """Tract FIPS → HPSA designations for joining external address/tract data."""
+    return _aggregate_hpsa_lookup(geography, "census_tract_fips")
+
+
+def build_county_lookup(geography: pd.DataFrame) -> pd.DataFrame:
+    """5-digit county FIPS → HPSA designations."""
+    return _aggregate_hpsa_lookup(geography, "county_fips")
+
+
+def build_county_subdivision_lookup(geography: pd.DataFrame) -> pd.DataFrame:
+    """10-digit county subdivision FIPS → HPSA designations."""
+    return _aggregate_hpsa_lookup(geography, "county_subdivision_fips")
+
+
+def load_pilot_sites(path: Path = PILOT_SITES_PATH) -> pd.DataFrame:
+    """Load community health center pilot site addresses."""
+    df = pd.read_excel(path)
+    df.columns = df.columns.str.lower().str.replace(" ", "_")
+    required = {"address", "city", "state", "zip"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Pilot sites file missing columns: {sorted(missing)}")
+    for col in required:
+        df[col] = df[col].astype(str).str.strip()
+    df["zip"] = df["zip"].str.replace(r"\.0$", "", regex=True).str.zfill(5)
+    return df.reset_index(drop=True)
+
+
+def format_oneline_address(
+    address: str, city: str, state: str, zip_code: str
+) -> str:
+    """Build a single-line address string for the Census geocoder."""
+    zip_code = re.sub(r"\.0$", "", str(zip_code).strip()).zfill(5)
+    return f"{address}, {city}, {state} {zip_code}"
+
+
+def geocode_address(
+    address: str,
+    city: str,
+    state: str,
+    zip_code: str,
+    *,
+    sleep_seconds: float = GEOCODER_SLEEP_SECONDS,
+) -> dict[str, Any]:
+    """
+    Geocode a US address via the Census Bureau geographies API.
+
+    Returns census tract, county, and county-subdivision FIPS when matched.
+    """
+    oneline = format_oneline_address(address, city, state, zip_code)
+    params = urllib.parse.urlencode(
+        {
+            "address": oneline,
+            "benchmark": GEOCODER_BENCHMARK,
+            "vintage": GEOCODER_VINTAGE,
+            "format": "json",
+        }
+    )
+    url = f"{CENSUS_GEOCODER_URL}?{params}"
+
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            payload = json.load(response)
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return {
+            "geocode_success": False,
+            "geocode_error": str(exc),
+            "geocode_input": oneline,
+            "geocode_matched_address": None,
+            "latitude": None,
+            "longitude": None,
+            "census_tract_fips": None,
+            "county_fips": None,
+            "county_subdivision_fips": None,
+        }
+
+    if sleep_seconds:
+        time.sleep(sleep_seconds)
+
+    matches = payload.get("result", {}).get("addressMatches", [])
+    if not matches:
+        return {
+            "geocode_success": False,
+            "geocode_error": "No address match returned by Census geocoder",
+            "geocode_input": oneline,
+            "geocode_matched_address": None,
+            "latitude": None,
+            "longitude": None,
+            "census_tract_fips": None,
+            "county_fips": None,
+            "county_subdivision_fips": None,
+        }
+
+    match = matches[0]
+    geographies = match.get("geographies", {})
+    coordinates = match.get("coordinates", {})
+
+    def first_geoid(geo_type: str) -> str | None:
+        items = geographies.get(geo_type, [])
+        return items[0]["GEOID"] if items else None
+
+    return {
+        "geocode_success": True,
+        "geocode_error": None,
+        "geocode_input": oneline,
+        "geocode_matched_address": match.get("matchedAddress"),
+        "latitude": coordinates.get("y"),
+        "longitude": coordinates.get("x"),
+        "census_tract_fips": first_geoid("Census Tracts"),
+        "county_fips": first_geoid("Counties"),
+        "county_subdivision_fips": first_geoid("County Subdivisions"),
+    }
+
+
+def _lookup_hpsa_matches(
+    lookup: pd.DataFrame,
+    geo_col: str,
+    geo_id: str | None,
+) -> dict[str, Any]:
+    """Return HPSA ids/names/types for a single geography id, or empty lists."""
+    if not geo_id:
+        return {"hpsa_ids": [], "hpsa_names": [], "designation_types": []}
+
+    hit = lookup.loc[lookup[geo_col] == geo_id]
+    if hit.empty:
+        return {"hpsa_ids": [], "hpsa_names": [], "designation_types": []}
+
+    row = hit.iloc[0]
+    return {
+        "hpsa_ids": row["hpsa_ids"],
+        "hpsa_names": row["hpsa_names"],
+        "designation_types": row["designation_types"],
+    }
+
+
+def _merge_hpsa_matches(*match_dicts: dict[str, Any]) -> dict[str, Any]:
+    """Combine HPSA matches from multiple geography levels, deduplicated by id."""
+    ids: list[Any] = []
+    names_by_id: dict[Any, str] = {}
+    types_by_id: dict[Any, str] = {}
+
+    for match in match_dicts:
+        for hpsa_id, hpsa_name, designation_type in zip(
+            match["hpsa_ids"], match["hpsa_names"], match["designation_types"]
+        ):
+            if hpsa_id not in names_by_id:
+                ids.append(hpsa_id)
+            names_by_id[hpsa_id] = hpsa_name
+            types_by_id[hpsa_id] = designation_type
+
+    return {
+        "hpsa_ids": ids,
+        "hpsa_names": [names_by_id[i] for i in ids],
+        "designation_types": [types_by_id[i] for i in ids],
+    }
+
+
+def _normalize_address(value: str) -> str:
+    """Normalize an address string for fuzzy facility matching."""
+    value = value.lower()
+    value = re.sub(r"[^\w\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _match_hpsa_facility(
+    address: str,
+    city: str,
+    state: str,
+    zip_code: str,
+    facility_sites: pd.DataFrame,
+) -> dict[str, Any]:
+    """Match against directly designated HPSA facility rows (POINT designations)."""
+    target = _normalize_address(
+        f"{address} {city} {state} {str(zip_code).zfill(5)}"
+    )
+    target_zip = str(zip_code).zfill(5)
+
+    candidates = facility_sites.copy()
+    candidates["zip5"] = (
+        candidates["hpsa_postal_code"]
+        .astype(str)
+        .str.extract(r"(\d{5})", expand=False)
+    )
+    candidates = candidates.loc[candidates["zip5"] == target_zip]
+    if candidates.empty:
+        return {"hpsa_ids": [], "hpsa_names": [], "designation_types": []}
+
+    candidates["norm_address"] = candidates.apply(
+        lambda row: _normalize_address(
+            f"{row.get('hpsa_address', '')} {row.get('hpsa_city', '')} "
+            f"{row.get('primary_state_abbreviation', '')} {row.get('zip5', '')}"
+        ),
+        axis=1,
+    )
+
+    exact = candidates.loc[candidates["norm_address"] == target]
+    if exact.empty:
+        # Allow partial match when the normalized street/city appears in facility text.
+        partial = candidates.loc[
+            candidates["norm_address"].str.contains(
+                _normalize_address(f"{address} {city}"), regex=False
+            )
+        ]
+        hit = partial
+    else:
+        hit = exact
+
+    if hit.empty:
+        return {"hpsa_ids": [], "hpsa_names": [], "designation_types": []}
+
+    return {
+        "hpsa_ids": hit[SITE_KEY].tolist(),
+        "hpsa_names": hit["hpsa_name"].tolist(),
+        "designation_types": hit["designation_type"].tolist(),
+    }
+
+
+def _empty_hpsa_match() -> dict[str, list[Any]]:
+    return {"hpsa_ids": [], "hpsa_names": [], "designation_types": []}
+
+
+def load_area_hpsa_boundaries(
+    path: Path = AREA_COMPONENT_BOUNDARIES_SHP,
+) -> "gpd.GeoDataFrame":
+    """Load designated primary-care area HPSA component polygons."""
+    if not HAS_GEOPANDAS:
+        raise ImportError("geopandas is required for boundary-based HPSA checks")
+    gdf = gpd.read_file(path)
+    return gdf.loc[
+        (gdf["HpsStatCD"] == "D") & (gdf["DscpClsDes"] == "Primary Care")
+    ].copy()
+
+
+def load_facility_hpsa_boundaries(
+    path: Path = FACILITY_HPSAS_SHP,
+) -> "gpd.GeoDataFrame":
+    """Load designated primary-care facility HPSA point locations."""
+    if not HAS_GEOPANDAS:
+        raise ImportError("geopandas is required for boundary-based HPSA checks")
+    gdf = gpd.read_file(path)
+    return gdf.loc[
+        (gdf["HpsStatCD"] == "D") & (gdf["DscpClsDes"] == "Primary Care")
+    ].copy()
+
+
+def _point_geodataframe(longitude: float, latitude: float) -> "gpd.GeoDataFrame":
+    return gpd.GeoDataFrame(
+        {"id": [1]},
+        geometry=[Point(longitude, latitude)],
+        crs="EPSG:4326",
+    )
+
+
+def _boundary_matches_from_hits(hits: "gpd.GeoDataFrame") -> dict[str, Any]:
+    """Collapse spatial join hits to unique HPSA designations."""
+    if hits.empty:
+        return _empty_hpsa_match()
+
+    deduped = hits.drop_duplicates(subset=["HpsSrcID"])
+    return {
+        "hpsa_ids": deduped["HpsSrcID"].tolist(),
+        "hpsa_names": deduped["HpsNM"].tolist(),
+        "designation_types": deduped["HpsTypDes"].tolist(),
+    }
+
+
+def match_point_to_area_boundaries(
+    longitude: float | None,
+    latitude: float | None,
+    area_boundaries: "gpd.GeoDataFrame",
+    *,
+    state: str | None = None,
+) -> dict[str, Any]:
+    """Return area HPSA matches for a geocoded point using HRSA polygons."""
+    if longitude is None or latitude is None:
+        return _empty_hpsa_match()
+
+    boundaries = area_boundaries
+    if state:
+        boundaries = area_boundaries.loc[
+            area_boundaries["StAbbr"].str.upper() == state.upper()
+        ]
+
+    point = _point_geodataframe(longitude, latitude)
+    hits = gpd.sjoin(point, boundaries, predicate="within")
+    return _boundary_matches_from_hits(hits)
+
+
+def match_point_to_facility_boundaries(
+    longitude: float | None,
+    latitude: float | None,
+    facility_boundaries: "gpd.GeoDataFrame",
+    *,
+    address: str,
+    city: str,
+    state: str,
+    zip_code: str,
+    max_distance_m: float = FACILITY_MATCH_MAX_DISTANCE_M,
+) -> dict[str, Any]:
+    """
+    Match a geocoded point to facility HPSA locations.
+
+    Uses normalized address text first, then nearest facility point within
+    ``max_distance_m`` meters.
+    """
+    if facility_boundaries.empty:
+        return _empty_hpsa_match()
+
+    target = _normalize_address(
+        f"{address} {city} {state} {str(zip_code).zfill(5)}"
+    )
+    target_zip = str(zip_code).zfill(5)
+
+    candidates = facility_boundaries.copy()
+    candidates["zip5"] = (
+        candidates["HpsZipCD"].astype(str).str.extract(r"(\d{5})", expand=False)
+    )
+    candidates = candidates.loc[candidates["zip5"] == target_zip]
+    if not candidates.empty:
+        candidates["norm_address"] = candidates.apply(
+            lambda row: _normalize_address(
+                f"{row.get('HpsAddr', '')} {row.get('HpsCity', '')} "
+                f"{row.get('HpsStAbbr', '')} {row.get('zip5', '')}"
+            ),
+            axis=1,
+        )
+        address_hit = candidates.loc[
+            (candidates["norm_address"] == target)
+            | candidates["norm_address"].str.contains(
+                _normalize_address(f"{address} {city}"), regex=False
+            )
+        ]
+        if not address_hit.empty:
+            return {
+                "hpsa_ids": address_hit["HpsSrcID"].tolist(),
+                "hpsa_names": address_hit["HpsNM"].tolist(),
+                "designation_types": address_hit["HpsTypDes"].tolist(),
+            }
+
+    if longitude is None or latitude is None:
+        return _empty_hpsa_match()
+
+    point = _point_geodataframe(longitude, latitude)
+    projected_point = point.to_crs("EPSG:5070")
+    projected_facilities = facility_boundaries.to_crs("EPSG:5070")
+    if state:
+        projected_facilities = projected_facilities.loc[
+            projected_facilities["HpsStAbbr"].str.upper() == state.upper()
+        ]
+
+    nearest = gpd.sjoin_nearest(
+        projected_point,
+        projected_facilities,
+        max_distance=max_distance_m,
+        distance_col="distance_m",
+    )
+    return _boundary_matches_from_hits(nearest)
+
+
+def check_address_in_hpsa(
+    address: str,
+    city: str,
+    state: str,
+    zip_code: str,
+    *,
+    tract_lookup: pd.DataFrame,
+    county_lookup: pd.DataFrame,
+    county_subdivision_lookup: pd.DataFrame,
+    facility_sites: pd.DataFrame,
+    area_boundaries: "gpd.GeoDataFrame | None" = None,
+    facility_boundaries: "gpd.GeoDataFrame | None" = None,
+    geocode: bool = True,
+    geocode_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Determine whether an address falls within a designated primary-care HPSA.
+
+    Uses HRSA boundary shapefiles when provided (highest confidence). Otherwise
+    falls back to geocoded tract/county lookup tables and spreadsheet facility
+    address matching.
+    """
+    geo = geocode_result or (
+        geocode_address(address, city, state, zip_code) if geocode else {}
+    )
+
+    tract_match = _lookup_hpsa_matches(
+        tract_lookup, "census_tract_fips", geo.get("census_tract_fips")
+    )
+    county_match = _lookup_hpsa_matches(
+        county_lookup, "county_fips", geo.get("county_fips")
+    )
+    subdiv_match = _lookup_hpsa_matches(
+        county_subdivision_lookup,
+        "county_subdivision_fips",
+        geo.get("county_subdivision_fips"),
+    )
+    lookup_area_match = _merge_hpsa_matches(tract_match, county_match, subdiv_match)
+
+    lookup_facility_match = _match_hpsa_facility(
+        address, city, state, zip_code, facility_sites
+    )
+
+    lookup_match_methods: list[str] = []
+    if tract_match["hpsa_ids"]:
+        lookup_match_methods.append("census_tract")
+    if county_match["hpsa_ids"]:
+        lookup_match_methods.append("county")
+    if subdiv_match["hpsa_ids"]:
+        lookup_match_methods.append("county_subdivision")
+    if lookup_facility_match["hpsa_ids"]:
+        lookup_match_methods.append("facility_spreadsheet")
+
+    boundary_area_match = _empty_hpsa_match()
+    boundary_facility_match = _empty_hpsa_match()
+    boundary_match_methods: list[str] = []
+    has_boundary_layers = area_boundaries is not None
+
+    if area_boundaries is not None:
+        boundary_area_match = match_point_to_area_boundaries(
+            geo.get("longitude"),
+            geo.get("latitude"),
+            area_boundaries,
+            state=state,
+        )
+        if boundary_area_match["hpsa_ids"]:
+            boundary_match_methods.append("area_polygon")
+
+    if facility_boundaries is not None:
+        boundary_facility_match = match_point_to_facility_boundaries(
+            geo.get("longitude"),
+            geo.get("latitude"),
+            facility_boundaries,
+            address=address,
+            city=city,
+            state=state,
+            zip_code=zip_code,
+        )
+        if boundary_facility_match["hpsa_ids"]:
+            boundary_match_methods.append("facility_point")
+
+    if has_boundary_layers:
+        area_match = boundary_area_match
+        facility_match = boundary_facility_match
+        match_methods = boundary_match_methods
+        in_hpsa_area = bool(boundary_area_match["hpsa_ids"])
+        is_hpsa_facility = bool(boundary_facility_match["hpsa_ids"])
+        all_match = _merge_hpsa_matches(boundary_area_match, boundary_facility_match)
+    else:
+        area_match = lookup_area_match
+        facility_match = lookup_facility_match
+        match_methods = lookup_match_methods
+        in_hpsa_area = bool(lookup_area_match["hpsa_ids"])
+        is_hpsa_facility = bool(lookup_facility_match["hpsa_ids"])
+        all_match = _merge_hpsa_matches(lookup_area_match, lookup_facility_match)
+
+    lookup_in_hpsa_area = bool(lookup_area_match["hpsa_ids"])
+    boundary_in_hpsa_area = bool(boundary_area_match["hpsa_ids"])
+    lookup_boundary_agree = (
+        lookup_in_hpsa_area == boundary_in_hpsa_area
+        if has_boundary_layers
+        else None
+    )
+
+    return {
+        **geo,
+        "in_hpsa": bool(all_match["hpsa_ids"]),
+        "in_hpsa_area": in_hpsa_area,
+        "is_hpsa_facility": is_hpsa_facility,
+        "match_methods": match_methods,
+        "matched_hpsa_ids": all_match["hpsa_ids"],
+        "matched_hpsa_names": all_match["hpsa_names"],
+        "matched_designation_types": all_match["designation_types"],
+        "matched_hpsa_ids_area": area_match["hpsa_ids"],
+        "matched_hpsa_ids_facility": facility_match["hpsa_ids"],
+        "in_hpsa_area_lookup": lookup_in_hpsa_area,
+        "in_hpsa_area_boundary": boundary_in_hpsa_area if has_boundary_layers else None,
+        "lookup_match_methods": lookup_match_methods,
+        "boundary_match_methods": boundary_match_methods if has_boundary_layers else None,
+        "lookup_matched_hpsa_names": lookup_area_match["hpsa_names"],
+        "boundary_matched_hpsa_names": boundary_area_match["hpsa_names"]
+        if has_boundary_layers
+        else None,
+        "lookup_boundary_agree": lookup_boundary_agree,
+        "used_boundary_layers": has_boundary_layers,
+    }
+
+
+def check_addresses_in_hpsa(
+    addresses: pd.DataFrame,
+    *,
+    tract_lookup: pd.DataFrame,
+    county_lookup: pd.DataFrame,
+    county_subdivision_lookup: pd.DataFrame,
+    facility_sites: pd.DataFrame,
+    area_boundaries: "gpd.GeoDataFrame | None" = None,
+    facility_boundaries: "gpd.GeoDataFrame | None" = None,
+) -> pd.DataFrame:
+    """Run HPSA checks for every row in an address dataframe."""
+    results = []
+    for _, row in addresses.iterrows():
+        results.append(
+            check_address_in_hpsa(
+                row["address"],
+                row["city"],
+                row["state"],
+                row["zip"],
+                tract_lookup=tract_lookup,
+                county_lookup=county_lookup,
+                county_subdivision_lookup=county_subdivision_lookup,
+                facility_sites=facility_sites,
+                area_boundaries=area_boundaries,
+                facility_boundaries=facility_boundaries,
+            )
+        )
+    result_df = pd.DataFrame(results)
+    return pd.concat([addresses.reset_index(drop=True), result_df], axis=1)
 
 
 def print_profile_summary(profile: dict) -> None:
@@ -274,18 +829,57 @@ This file mixes two designation models:
    hpsa_tract_lookup.csv or hpsa_geography.csv.
 
 Recommended join workflow for arbitrary job locations:
-  a) Geocode job address → census tract FIPS (11 digits: SSCCCTTTTTT).
-  b) Left-join to hpsa_tract_lookup on census_tract_fips.
-  c) If n_hpsa_sites >= 1, the location is in at least one designated HPSA.
+  a) Geocode job address → lat/lon (Census geocoder).
+  b) Point-in-polygon against Area HPSA Component Boundaries SHP (best confidence).
+  c) Cross-check via census tract FIPS join to hpsa_tract_lookup.csv when useful.
   d) Optionally join hpsa_sites for scores, designation type, dates.
 
 Caveats:
   - 149 census tracts appear in more than one HPSA designation; retain all matches.
-  - Area-based rows have no lat/lon; only facility rows do.
+  - Tract lookup is fast and usually agrees with HRSA polygons; shapefiles are authoritative.
+  - Area-based spreadsheet rows have no lat/lon; only facility rows do.
   - hpsa_name is not unique (7120 names vs 7666 ids); always key on hpsa_id.
   - This file is Primary Care only; other discipline HPSAs are separate datasets.
 """
     )
+
+
+def print_pilot_site_results(results: pd.DataFrame) -> None:
+    """Print a concise summary of pilot-site HPSA checks."""
+    print()
+    print("=" * 72)
+    print("Community health center pilot sites — HPSA checks")
+    print("=" * 72)
+    print(f"Sites checked: {len(results)}")
+    print(f"In designated HPSA: {results['in_hpsa'].sum()}")
+    print(f"In HPSA area: {results['in_hpsa_area'].sum()}")
+    print(f"Direct HPSA facility match: {results['is_hpsa_facility'].sum()}")
+    print(f"Geocode failures: {(~results['geocode_success']).sum()}")
+
+    if results["used_boundary_layers"].any():
+        print(f"In HPSA area (tract/county lookup): {results['in_hpsa_area_lookup'].sum()}")
+        print(f"In HPSA area (HRSA polygons): {results['in_hpsa_area_boundary'].sum()}")
+        disagreements = results.loc[~results["lookup_boundary_agree"]]
+        print(f"Lookup vs boundary disagreements: {len(disagreements)}")
+        print("Match method: HRSA boundary shapefiles (area polygons + facility points)")
+
+    print()
+    display_cols = [
+        "address",
+        "city",
+        "zip",
+        "geocode_success",
+        "in_hpsa",
+        "in_hpsa_area",
+        "matched_hpsa_names",
+    ]
+    if results["used_boundary_layers"].any():
+        display_cols.extend(
+            ["in_hpsa_area_lookup", "in_hpsa_area_boundary", "lookup_boundary_agree"]
+        )
+    else:
+        display_cols.extend(["match_methods", "census_tract_fips"])
+    print(results[display_cols].to_string(index=False))
 
 
 def main() -> None:
@@ -298,10 +892,17 @@ def main() -> None:
     sites = build_site_table(df)
     geography = build_geography_table(df)
     tract_lookup = build_tract_lookup(geography)
+    county_lookup = build_county_lookup(geography)
+    county_subdivision_lookup = build_county_subdivision_lookup(geography)
+    facility_sites = sites.loc[sites["is_facility_designation"]].copy()
 
     sites.to_csv(OUTPUT_DIR / "hpsa_sites.csv", index=False)
     geography.to_csv(OUTPUT_DIR / "hpsa_geography.csv", index=False)
     tract_lookup.to_csv(OUTPUT_DIR / "hpsa_tract_lookup.csv", index=False)
+    county_lookup.to_csv(OUTPUT_DIR / "hpsa_county_lookup.csv", index=False)
+    county_subdivision_lookup.to_csv(
+        OUTPUT_DIR / "hpsa_county_subdivision_lookup.csv", index=False
+    )
     profile["completeness"].to_csv(OUTPUT_DIR / "column_completeness.csv", index=False)
     profile["designation_type_breakdown"].to_csv(
         OUTPUT_DIR / "designation_type_breakdown.csv"
@@ -320,6 +921,42 @@ def main() -> None:
     assert geography.drop_duplicates(subset=[SITE_KEY, "geo_id"]).shape[0] == len(geography)
 
     print_linking_guidance()
+
+    if PILOT_SITES_PATH.exists():
+        pilot_sites = load_pilot_sites(PILOT_SITES_PATH)
+
+        area_boundaries = None
+        facility_boundaries = None
+        if AREA_COMPONENT_BOUNDARIES_SHP.exists() and HAS_GEOPANDAS:
+            print()
+            print("Loading HRSA boundary shapefiles for point-in-polygon checks...")
+            area_boundaries = load_area_hpsa_boundaries()
+            print(f"  Area component polygons: {len(area_boundaries):,}")
+            if FACILITY_HPSAS_SHP.exists():
+                facility_boundaries = load_facility_hpsa_boundaries()
+                print(f"  Facility points: {len(facility_boundaries):,}")
+        elif AREA_COMPONENT_BOUNDARIES_SHP.exists() and not HAS_GEOPANDAS:
+            print()
+            print("Boundary shapefiles found but geopandas is not installed.")
+            print("Install geopandas to enable polygon-based HPSA checks.")
+
+        pilot_results = check_addresses_in_hpsa(
+            pilot_sites,
+            tract_lookup=tract_lookup,
+            county_lookup=county_lookup,
+            county_subdivision_lookup=county_subdivision_lookup,
+            facility_sites=facility_sites,
+            area_boundaries=area_boundaries,
+            facility_boundaries=facility_boundaries,
+        )
+        pilot_results.to_csv(OUTPUT_DIR / "pilot_sites_hpsa_check.csv", index=False)
+        print_pilot_site_results(pilot_results)
+        print()
+        print("Pilot site results written to:", OUTPUT_DIR / "pilot_sites_hpsa_check.csv")
+    else:
+        print()
+        print(f"Pilot sites file not found: {PILOT_SITES_PATH}")
+        print("Skipping address-level HPSA checks.")
 
 
 if __name__ == "__main__":
