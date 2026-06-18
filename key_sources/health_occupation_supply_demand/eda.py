@@ -25,7 +25,7 @@ DATA_PATH = Path(
     "/Healthcare Occupations Supply Demand/Workforce_Projections_FullData.xlsx"
 )
 DATA_SHEET = "Stacked FY2025"
-OUTPUT_DIR = Path(__file__).parent / "output"
+OUTPUT_DIR = DATA_PATH.parent / "output"
 
 ROW_KEY = ["year", "profession_group", "profession", "state", "rurality"]
 
@@ -61,6 +61,9 @@ DEMAND_COLUMNS = [
 ]
 
 VALUE_COLUMNS = SUPPLY_COLUMNS + DEMAND_COLUMNS + ["percent_adequacy"]
+
+DEMAND_COL = "fte_demand_projections__demand"
+NATIONAL_GEO = {"state": "Total", "rurality": "Total"}
 
 SCENARIO_LABELS = {
     "fte_supply_projections__fewer_graduates": "Supply — fewer graduates",
@@ -174,6 +177,101 @@ def build_scenario_summary(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(["null_pct", "column"])
 
 
+def _count_demand_decline_years(group: pd.DataFrame, demand_col: str) -> pd.Series:
+    """Count year-over-year demand decreases within one occupation series."""
+    ordered = group.sort_values("year")
+    declines = ordered[demand_col].diff() < 0
+    return pd.Series(
+        {
+            "n_decline_years": int(declines.sum()),
+            "any_yoy_decline": bool(declines.any()),
+        }
+    )
+
+
+def build_occupation_demand_trends(
+    df: pd.DataFrame,
+    group_cols: list[str],
+    *,
+    start_year: int,
+    end_year: int,
+    demand_col: str = DEMAND_COL,
+) -> pd.DataFrame:
+    """Summarize baseline demand change and year-over-year declines for one geography slice."""
+    start = (
+        df.loc[df["year"] == start_year, [*group_cols, demand_col]]
+        .drop_duplicates(subset=group_cols)
+        .rename(columns={demand_col: "demand_start"})
+    )
+    end = (
+        df.loc[df["year"] == end_year, [*group_cols, demand_col]]
+        .drop_duplicates(subset=group_cols)
+        .rename(columns={demand_col: "demand_end"})
+    )
+
+    trends = start.merge(end, on=group_cols, how="inner")
+    trends["start_year"] = start_year
+    trends["end_year"] = end_year
+    trends["change_abs"] = trends["demand_end"] - trends["demand_start"]
+    trends["change_pct"] = (
+        100 * (trends["demand_end"] / trends["demand_start"] - 1)
+    ).round(2)
+
+    yoy = (
+        df.groupby(group_cols, as_index=False)
+        .apply(_count_demand_decline_years, demand_col=demand_col, include_groups=False)
+    )
+    trends = trends.merge(yoy, on=group_cols, how="left")
+    return trends.sort_values(group_cols).reset_index(drop=True)
+
+
+def build_demand_trend_summary(df: pd.DataFrame) -> dict[str, Any]:
+    """Analyze baseline demand trends nationally and by state."""
+    start_year = int(df["year"].min())
+    end_year = int(df["year"].max())
+
+    national = df.loc[
+        (df["state"] == NATIONAL_GEO["state"])
+        & (df["rurality"] == NATIONAL_GEO["rurality"])
+    ]
+    national_trends = build_occupation_demand_trends(
+        national,
+        ["profession_group", "profession"],
+        start_year=start_year,
+        end_year=end_year,
+    )
+
+    state_rows = df.loc[(df["state"] != "Total") & (df["rurality"] == "Total")]
+    state_trends = build_occupation_demand_trends(
+        state_rows,
+        ["state", "profession_group", "profession"],
+        start_year=start_year,
+        end_year=end_year,
+    )
+    state_net_declining = state_trends.loc[state_trends["change_abs"] < 0].copy()
+    state_decline_by_profession = (
+        state_net_declining.groupby(["profession_group", "profession"], as_index=False)
+        .size()
+        .rename(columns={"size": "n_states_declining"})
+        .sort_values("n_states_declining", ascending=False)
+    )
+
+    return {
+        "start_year": start_year,
+        "end_year": end_year,
+        "national_trends": national_trends,
+        "national_net_declining": national_trends.loc[
+            national_trends["change_abs"] < 0
+        ].sort_values("change_pct"),
+        "national_yoy_declining": national_trends.loc[
+            national_trends["any_yoy_decline"]
+        ].sort_values("n_decline_years", ascending=False),
+        "state_trends": state_trends,
+        "state_net_declining": state_net_declining.sort_values("change_pct"),
+        "state_decline_by_profession": state_decline_by_profession,
+    }
+
+
 def build_supply_gap_summary(df: pd.DataFrame) -> pd.DataFrame:
     """Identify occupations that lack state-level supply but still have demand."""
     supply_col = "fte_supply_projections__supply"
@@ -238,6 +336,7 @@ def profile_dataset(df: pd.DataFrame) -> dict[str, Any]:
         "dimensions": dimensions,
         "scenario_summary": build_scenario_summary(df),
         "supply_gap_summary": build_supply_gap_summary(df),
+        "demand_trends": build_demand_trend_summary(df),
         "completeness": completeness,
         "constant_columns": constant_cols,
         "adequacy_is_supply_over_demand": adequacy_max_diff == 0.0
@@ -289,6 +388,23 @@ def write_outputs(df: pd.DataFrame, profile: dict[str, Any]) -> Path:
             )
     pd.DataFrame(profession_catalog).to_csv(
         OUTPUT_DIR / "profession_catalog.csv", index=False
+    )
+
+    demand_trends = profile["demand_trends"]
+    demand_trends["national_trends"].to_csv(
+        OUTPUT_DIR / "demand_trends_national.csv", index=False
+    )
+    demand_trends["national_net_declining"].to_csv(
+        OUTPUT_DIR / "demand_trends_national_declining.csv", index=False
+    )
+    demand_trends["national_yoy_declining"].to_csv(
+        OUTPUT_DIR / "demand_trends_national_yoy_declines.csv", index=False
+    )
+    demand_trends["state_net_declining"].to_csv(
+        OUTPUT_DIR / "demand_trends_state_declining.csv", index=False
+    )
+    demand_trends["state_decline_by_profession"].to_csv(
+        OUTPUT_DIR / "demand_trends_state_decline_by_profession.csv", index=False
     )
 
     return OUTPUT_DIR
@@ -346,6 +462,82 @@ Key structural details beyond that summary:
     print()
     print("Rurality patterns by state:")
     print(dims["state_rurality_patterns"].to_string(index=False))
+
+
+def print_demand_trends_summary(profile: dict[str, Any]) -> None:
+    """Print baseline demand trend findings for national and state geographies."""
+    trends = profile["demand_trends"]
+    start_year = trends["start_year"]
+    end_year = trends["end_year"]
+    national = trends["national_trends"]
+    net_declining = trends["national_net_declining"]
+    yoy_declining = trends["national_yoy_declining"]
+    state_declining = trends["state_net_declining"]
+    state_by_prof = trends["state_decline_by_profession"]
+
+    print()
+    print("=" * 72)
+    print("Healthcare Occupations Supply & Demand — demand trends")
+    print("=" * 72)
+    print(
+        f"Baseline demand column: {DEMAND_COL}\n"
+        f"National reference geography: State = 'Total', Rurality = 'Total'\n"
+        f"Comparison window: {start_year} → {end_year}"
+    )
+    print()
+    print(
+        f"National occupations with lower {end_year} vs {start_year} demand: "
+        f"{len(net_declining)} of {len(national)}"
+    )
+    if net_declining.empty:
+        print("  (none)")
+    else:
+        display_cols = [
+            "profession_group",
+            "profession",
+            "demand_start",
+            "demand_end",
+            "change_abs",
+            "change_pct",
+            "n_decline_years",
+        ]
+        print(net_declining[display_cols].to_string(index=False))
+
+    print()
+    print(
+        f"National occupations with any year-over-year demand decline: "
+        f"{len(yoy_declining)} of {len(national)}"
+    )
+    if not yoy_declining.empty:
+        print(
+            yoy_declining[
+                ["profession_group", "profession", "change_pct", "n_decline_years"]
+            ]
+            .head(10)
+            .to_string(index=False)
+        )
+        if len(yoy_declining) > 10:
+            print(
+                "  ... see demand_trends_national_yoy_declines.csv for full list"
+            )
+
+    print()
+    print(
+        f"State-level profession combinations with lower {end_year} vs {start_year} "
+        f"demand: {len(state_declining)} of {len(trends['state_trends'])}"
+    )
+    print(
+        "Note: state FTE values are often rounded to the nearest 10, so large "
+        "percentage drops can reflect rounding as well as modeled decline."
+    )
+    if not state_by_prof.empty:
+        print()
+        print("States with net demand decline, by occupation (top 10):")
+        print(state_by_prof.head(10).to_string(index=False))
+        if len(state_by_prof) > 10:
+            print(
+                "  ... see demand_trends_state_decline_by_profession.csv for full list"
+            )
 
 
 def print_profile_summary(profile: dict[str, Any]) -> None:
@@ -412,6 +604,7 @@ def main() -> None:
 
     print_structure_summary(profile)
     print_profile_summary(profile)
+    print_demand_trends_summary(profile)
 
     out_dir = write_outputs(df, profile)
     print()
@@ -421,6 +614,11 @@ def main() -> None:
     print("  scenario_summary.csv          — scenario column coverage")
     print("  supply_gap_by_profession.csv  — state-level supply gaps by occupation")
     print("  profession_catalog.csv        — profession group → profession mapping")
+    print("  demand_trends_national.csv    — national demand change by occupation")
+    print("  demand_trends_national_declining.csv — occupations with net national decline")
+    print("  demand_trends_national_yoy_declines.csv — occupations with any YoY decline")
+    print("  demand_trends_state_declining.csv — state-level net demand declines")
+    print("  demand_trends_state_decline_by_profession.csv — decline counts by occupation")
 
     assert profile["duplicate_key_rows"] == 0
     assert profile["unique_keys"] == len(df)
