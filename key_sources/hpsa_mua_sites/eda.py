@@ -481,7 +481,7 @@ def _lookup_mua_matches(
     geo_id: str | None,
 ) -> dict[str, Any]:
     """Return MUA/P matches for one geography id from a lookup table."""
-    if not geo_id:
+    if not geo_id or lookup is None:
         return _empty_hpsa_match()
 
     if geo_col not in lookup.columns:
@@ -540,40 +540,40 @@ def check_address_in_mua(
     geocode: bool = True,
     geocode_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Determine whether an address falls within a designated MUA/P."""
+    """
+    Determine whether an address falls within a designated MUA/P.
+
+    Uses MUA_SHP polygons when available (preferred). Falls back to geocoded
+    tract/county lookup tables only when the shapefile is not loaded.
+    """
     geo = geocode_result or (
         geocode_address(address, city, state, zip_code) if geocode else {}
     )
 
-    tract_match = _lookup_mua_matches(
-        assets.tract_lookup, "census_tract_fips", geo.get("census_tract_fips")
-    )
-    county_match = _lookup_mua_matches(
-        assets.county_lookup, "county_fips", geo.get("county_fips")
-    )
-    subdiv_match = _lookup_mua_matches(
-        assets.county_subdivision_lookup,
-        "county_subdiv_fips",
-        geo.get("county_subdivision_fips"),
-    )
-    lookup_match = _merge_hpsa_matches(tract_match, county_match, subdiv_match)
+    match_methods: list[str] = []
 
-    boundary_match = _empty_hpsa_match()
-    has_boundaries = assets.boundaries is not None
-    if has_boundaries:
-        boundary_match = match_point_to_mua_boundaries(
+    if assets.boundaries is not None:
+        final_match = match_point_to_mua_boundaries(
             geo.get("longitude"),
             geo.get("latitude"),
             assets.boundaries,
             state=state,
         )
-
-    if has_boundaries:
-        final_match = boundary_match
-        match_methods = ["mua_polygon"] if boundary_match["hpsa_ids"] else []
+        if final_match["hpsa_ids"]:
+            match_methods.append("mua_polygon")
     else:
-        final_match = lookup_match
-        match_methods = []
+        tract_match = _lookup_mua_matches(
+            assets.tract_lookup, "census_tract_fips", geo.get("census_tract_fips")
+        )
+        county_match = _lookup_mua_matches(
+            assets.county_lookup, "county_fips", geo.get("county_fips")
+        )
+        subdiv_match = _lookup_mua_matches(
+            assets.county_subdivision_lookup,
+            "county_subdiv_fips",
+            geo.get("county_subdivision_fips"),
+        )
+        final_match = _merge_hpsa_matches(tract_match, county_match, subdiv_match)
         if tract_match["hpsa_ids"]:
             match_methods.append("census_tract")
         if county_match["hpsa_ids"]:
@@ -581,23 +581,12 @@ def check_address_in_mua(
         if subdiv_match["hpsa_ids"]:
             match_methods.append("county_subdivision")
 
-    lookup_in_mua = bool(lookup_match["hpsa_ids"])
-    boundary_in_mua = bool(boundary_match["hpsa_ids"])
-
     return {
         "in_mua": bool(final_match["hpsa_ids"]),
-        "in_mua_lookup": lookup_in_mua,
-        "in_mua_boundary": boundary_in_mua if has_boundaries else None,
-        "lookup_boundary_agree": lookup_in_mua == boundary_in_mua if has_boundaries else None,
         "match_methods": match_methods,
         "matched_mua_ids": final_match["hpsa_ids"],
         "matched_mua_names": final_match["hpsa_names"],
         "matched_designation_types": final_match["designation_types"],
-        "lookup_matched_mua_names": lookup_match["hpsa_names"],
-        "boundary_matched_mua_names": boundary_match["hpsa_names"]
-        if has_boundaries
-        else None,
-        "used_boundary_layer": has_boundaries,
     }
 
 
@@ -985,7 +974,7 @@ def _lookup_hpsa_matches(
     geo_id: str | None,
 ) -> dict[str, Any]:
     """Return HPSA ids/names/types for a single geography id, or empty lists."""
-    if not geo_id:
+    if not geo_id or lookup is None:
         return {"hpsa_ids": [], "hpsa_names": [], "designation_types": []}
 
     hit = lookup.loc[lookup[geo_col] == geo_id]
@@ -1233,10 +1222,10 @@ def check_address_in_hpsa(
     state: str,
     zip_code: str,
     *,
-    tract_lookup: pd.DataFrame,
-    county_lookup: pd.DataFrame,
-    county_subdivision_lookup: pd.DataFrame,
-    facility_sites: pd.DataFrame,
+    tract_lookup: pd.DataFrame | None = None,
+    county_lookup: pd.DataFrame | None = None,
+    county_subdivision_lookup: pd.DataFrame | None = None,
+    facility_sites: pd.DataFrame | None = None,
     area_boundaries: "gpd.GeoDataFrame | None" = None,
     facility_boundaries: "gpd.GeoDataFrame | None" = None,
     geocode: bool = True,
@@ -1245,58 +1234,46 @@ def check_address_in_hpsa(
     """
     Determine whether an address falls within a designated HPSA for one domain.
 
-    Uses HRSA boundary shapefiles when provided (highest confidence). Otherwise
-    falls back to geocoded tract/county lookup tables and spreadsheet facility
-    address matching.
+    Uses HRSA boundary shapefiles when available (preferred). Falls back to
+    geocoded tract/county lookup tables only when shapefiles are not loaded.
     """
     geo = geocode_result or (
         geocode_address(address, city, state, zip_code) if geocode else {}
     )
 
-    tract_match = _lookup_hpsa_matches(
-        tract_lookup, "census_tract_fips", geo.get("census_tract_fips")
-    )
-    county_match = _lookup_hpsa_matches(
-        county_lookup, "county_fips", geo.get("county_fips")
-    )
-    subdiv_match = _lookup_hpsa_matches(
-        county_subdivision_lookup,
-        "county_subdivision_fips",
-        geo.get("county_subdivision_fips"),
-    )
-    lookup_area_match = _merge_hpsa_matches(tract_match, county_match, subdiv_match)
-
-    lookup_facility_match = _match_hpsa_facility(
-        address, city, state, zip_code, facility_sites
-    )
-
-    lookup_match_methods: list[str] = []
-    if tract_match["hpsa_ids"]:
-        lookup_match_methods.append("census_tract")
-    if county_match["hpsa_ids"]:
-        lookup_match_methods.append("county")
-    if subdiv_match["hpsa_ids"]:
-        lookup_match_methods.append("county_subdivision")
-    if lookup_facility_match["hpsa_ids"]:
-        lookup_match_methods.append("facility_spreadsheet")
-
-    boundary_area_match = _empty_hpsa_match()
-    boundary_facility_match = _empty_hpsa_match()
-    boundary_match_methods: list[str] = []
-    has_boundary_layers = area_boundaries is not None
+    match_methods: list[str] = []
 
     if area_boundaries is not None:
-        boundary_area_match = match_point_to_area_boundaries(
+        area_match = match_point_to_area_boundaries(
             geo.get("longitude"),
             geo.get("latitude"),
             area_boundaries,
             state=state,
         )
-        if boundary_area_match["hpsa_ids"]:
-            boundary_match_methods.append("area_polygon")
+        if area_match["hpsa_ids"]:
+            match_methods.append("area_polygon")
+    else:
+        tract_match = _lookup_hpsa_matches(
+            tract_lookup, "census_tract_fips", geo.get("census_tract_fips")
+        )
+        county_match = _lookup_hpsa_matches(
+            county_lookup, "county_fips", geo.get("county_fips")
+        )
+        subdiv_match = _lookup_hpsa_matches(
+            county_subdivision_lookup,
+            "county_subdivision_fips",
+            geo.get("county_subdivision_fips"),
+        )
+        area_match = _merge_hpsa_matches(tract_match, county_match, subdiv_match)
+        if tract_match["hpsa_ids"]:
+            match_methods.append("census_tract")
+        if county_match["hpsa_ids"]:
+            match_methods.append("county")
+        if subdiv_match["hpsa_ids"]:
+            match_methods.append("county_subdivision")
 
     if facility_boundaries is not None:
-        boundary_facility_match = match_point_to_facility_boundaries(
+        facility_match = match_point_to_facility_boundaries(
             geo.get("longitude"),
             geo.get("latitude"),
             facility_boundaries,
@@ -1305,53 +1282,28 @@ def check_address_in_hpsa(
             state=state,
             zip_code=zip_code,
         )
-        if boundary_facility_match["hpsa_ids"]:
-            boundary_match_methods.append("facility_point")
-
-    if has_boundary_layers:
-        area_match = boundary_area_match
-        facility_match = boundary_facility_match
-        match_methods = boundary_match_methods
-        in_hpsa_area = bool(boundary_area_match["hpsa_ids"])
-        is_hpsa_facility = bool(boundary_facility_match["hpsa_ids"])
-        all_match = _merge_hpsa_matches(boundary_area_match, boundary_facility_match)
+        if facility_match["hpsa_ids"]:
+            match_methods.append("facility_point")
+    elif facility_sites is not None:
+        facility_match = _match_hpsa_facility(
+            address, city, state, zip_code, facility_sites
+        )
+        if facility_match["hpsa_ids"]:
+            match_methods.append("facility_spreadsheet")
     else:
-        area_match = lookup_area_match
-        facility_match = lookup_facility_match
-        match_methods = lookup_match_methods
-        in_hpsa_area = bool(lookup_area_match["hpsa_ids"])
-        is_hpsa_facility = bool(lookup_facility_match["hpsa_ids"])
-        all_match = _merge_hpsa_matches(lookup_area_match, lookup_facility_match)
+        facility_match = _empty_hpsa_match()
 
-    lookup_in_hpsa_area = bool(lookup_area_match["hpsa_ids"])
-    boundary_in_hpsa_area = bool(boundary_area_match["hpsa_ids"])
-    lookup_boundary_agree = (
-        lookup_in_hpsa_area == boundary_in_hpsa_area
-        if has_boundary_layers
-        else None
-    )
+    all_match = _merge_hpsa_matches(area_match, facility_match)
 
     return {
         **geo,
         "in_hpsa": bool(all_match["hpsa_ids"]),
-        "in_hpsa_area": in_hpsa_area,
-        "is_hpsa_facility": is_hpsa_facility,
+        "in_hpsa_area": bool(area_match["hpsa_ids"]),
+        "is_hpsa_facility": bool(facility_match["hpsa_ids"]),
         "match_methods": match_methods,
         "matched_hpsa_ids": all_match["hpsa_ids"],
         "matched_hpsa_names": all_match["hpsa_names"],
         "matched_designation_types": all_match["designation_types"],
-        "matched_hpsa_ids_area": area_match["hpsa_ids"],
-        "matched_hpsa_ids_facility": facility_match["hpsa_ids"],
-        "in_hpsa_area_lookup": lookup_in_hpsa_area,
-        "in_hpsa_area_boundary": boundary_in_hpsa_area if has_boundary_layers else None,
-        "lookup_match_methods": lookup_match_methods,
-        "boundary_match_methods": boundary_match_methods if has_boundary_layers else None,
-        "lookup_matched_hpsa_names": lookup_area_match["hpsa_names"],
-        "boundary_matched_hpsa_names": boundary_area_match["hpsa_names"]
-        if has_boundary_layers
-        else None,
-        "lookup_boundary_agree": lookup_boundary_agree,
-        "used_boundary_layers": has_boundary_layers,
     }
 
 
@@ -1433,7 +1385,7 @@ def check_addresses_all_domains(
             record[f"in_hpsa_area_{domain_key}"] = check["in_hpsa_area"]
             record[f"is_hpsa_facility_{domain_key}"] = check["is_hpsa_facility"]
             record[f"matched_hpsa_names_{domain_key}"] = check["matched_hpsa_names"]
-            record[f"lookup_boundary_agree_{domain_key}"] = check["lookup_boundary_agree"]
+            record[f"match_methods_{domain_key}"] = check["match_methods"]
 
         record["in_hpsa_any"] = any(
             record[f"in_hpsa_{domain_key}"] for domain_key in domain_assets
@@ -1450,10 +1402,8 @@ def check_addresses_all_domains(
                 geocode_result=geo,
             )
             record["in_mua"] = mua_check["in_mua"]
-            record["in_mua_lookup"] = mua_check["in_mua_lookup"]
-            record["in_mua_boundary"] = mua_check["in_mua_boundary"]
-            record["lookup_boundary_agree_mua"] = mua_check["lookup_boundary_agree"]
             record["matched_mua_names"] = mua_check["matched_mua_names"]
+            record["match_methods_mua"] = mua_check["match_methods"]
 
         record["in_hpsa_or_mua"] = record["in_hpsa_any"] or (
             mua_assets is not None and record.get("in_mua", False)
@@ -1522,23 +1472,20 @@ This file mixes two designation models:
 
 Recommended join workflow for arbitrary job locations:
   a) Geocode job address → lat/lon (Census geocoder).
-  b) Point-in-polygon against Area HPSA Component Boundaries SHP (best confidence).
-  c) Cross-check via census tract FIPS join to hpsa_tract_lookup.csv when useful.
-  d) Optionally join hpsa_sites for scores, designation type, dates.
+  b) Point-in-polygon against HRSA boundary shapefiles (HPSA_CMP* for area HPSAs,
+     HPSA_PNT* for facility HPSAs, MUA_SHP for MUA/P).
+  c) Tract/county lookup tables (exported as CSV) are a fallback only when
+     shapefiles or geopandas are unavailable — not used when SHP layers are loaded.
 
 Caveats:
   - 149 census tracts appear in more than one HPSA designation; retain all matches.
-  - Tract lookup is fast and usually agrees with HRSA polygons; shapefiles are authoritative.
-  - Area-based spreadsheet rows have no lat/lon; only facility rows do.
   - hpsa_name is not unique (7120 names vs 7666 ids); always key on hpsa_id.
   - hpsa_id is not unique across domains; always include discipline/domain.
   - This analysis supports Primary Care, Dental Health, and Mental Health separately.
 
 MUA/P (Medically Underserved Areas/Populations):
   - Detail file: MUA_DET.xlsx (component rows); shapefile: MUA_SHP (designation polygons).
-  - Geocode address → point-in-polygon against MUA_SHP for highest confidence.
-  - Spreadsheet tract lookup uses derived tract FIPS; may disagree with geocoder in
-    some states due to county/tract coding differences — prefer MUA_SHP when available.
+  - Address checks use MUA_SHP point-in-polygon when the shapefile is loaded.
 """
     )
 
@@ -1567,20 +1514,16 @@ def print_pilot_site_results(
         in_col = f"in_hpsa_{domain_key}"
         area_col = f"in_hpsa_area_{domain_key}"
         facility_col = f"is_hpsa_facility_{domain_key}"
-        agree_col = f"lookup_boundary_agree_{domain_key}"
-        print(f"{label}: {results[in_col].sum()} in HPSA ({results[area_col].sum()} area, {results[facility_col].sum()} facility)")
-        if agree_col in results.columns and results[agree_col].notna().any():
-            disagreements = results.loc[results[agree_col] == False]  # noqa: E712
-            print(f"  Lookup vs boundary disagreements: {len(disagreements)}")
+        method = "shapefile" if assets.area_boundaries is not None else "tract lookup"
+        print(
+            f"{label}: {results[in_col].sum()} in HPSA "
+            f"({results[area_col].sum()} area, {results[facility_col].sum()} facility) "
+            f"[{method}]"
+        )
 
     if mua_assets is not None and "in_mua" in results.columns:
-        print(
-            f"MUA/P: {results['in_mua'].sum()} in MUA/P "
-            f"({results['in_mua_boundary'].sum()} boundary, {results['in_mua_lookup'].sum()} lookup)"
-        )
-        if results["lookup_boundary_agree_mua"].notna().any():
-            disagreements = results.loc[results["lookup_boundary_agree_mua"] == False]  # noqa: E712
-            print(f"  MUA lookup vs boundary disagreements: {len(disagreements)}")
+        method = "shapefile" if mua_assets.boundaries is not None else "tract lookup"
+        print(f"MUA/P: {results['in_mua'].sum()} in MUA/P [{method}]")
 
     print()
     display_cols = ["address", "city", "zip", "geocode_success", "in_hpsa_any"]
