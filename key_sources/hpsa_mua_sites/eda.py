@@ -37,7 +37,7 @@ HPSA_BASE = Path(
     "/My Drive/CesarK_CPT_project/data/key_data_sources"
     "/HPSA MUAP Sites"
 )
-OUTPUT_DIR = Path(__file__).parent / "output"
+OUTPUT_DIR = HPSA_BASE / "output"
 PILOT_SITES_PATH = Path(
     "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
     "/My Drive/CesarK_CPT_project/data/community_health_center_pilot_sites.xlsx"
