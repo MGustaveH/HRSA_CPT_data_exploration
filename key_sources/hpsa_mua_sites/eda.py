@@ -1,11 +1,10 @@
 """
-Exploratory analysis of HRSA HPSA detail data across occupational domains
-(Primary Care, Dental Health, Mental Health).
+Exploratory analysis of HRSA HPSA and MUA/P (Medically Underserved Area/Population)
+data across occupational domains (Primary Care, Dental Health, Mental Health).
 
-Each row is a geographic *component* of an HPSA designation. Area-based
-designations (Population, Geographic, High Needs Geographic) span many rows —
-one per census tract, county, or county subdivision. Facility-based designations
-(FQHC, RHC, IHS, etc.) have exactly one row each with geo id "POINT".
+HPSA detail rows are geographic *components* of a designation. MUA/P detail rows follow
+a similar component structure (census tract, county, county subdivision). Boundary
+shapefiles support point-in-polygon address checks.
 """
 
 from __future__ import annotations
@@ -125,6 +124,482 @@ def get_domain_paths(domain_key: str) -> HPSADomainPaths:
         area_component_shp=find_boundary_shp(boundaries_dir, "CMP"),
         facility_shp=find_boundary_shp(boundaries_dir, "PNT"),
     )
+
+
+MUA_DIR = HPSA_BASE / "Medically Underserved Areas Populations (MUA P)"
+MUA_DET_XLSX = MUA_DIR / "MUA_DET.xlsx"
+MUA_BOUNDARIES_SHP = MUA_DIR / "MUA_SHP/MUA_SHP_DET_CUR_VX.shp"
+MUA_SITE_KEY = "mua_id"
+
+MUA_SITE_COLUMNS = [
+    "mua_id",
+    "mua_area_code",
+    "mua_service_area_name",
+    "designation_type",
+    "designation_type_code",
+    "mua_status_code",
+    "mua_status_description",
+    "designation_date",
+    "mua_update_date",
+    "imu_score",
+    "population_type",
+    "mua_population_type_code",
+    "mua_metropolitan_description",
+    "rural_status_description",
+    "primary_state_abbreviation",
+    "primary_state_name",
+    "primary_state_fips_code",
+    "designation_population_in_a_mua",
+    "mua_total_resident_civilian_population",
+    "providers_per_1000_population",
+    "ratio_of_providers_per_1000_population",
+]
+
+MUA_GEO_COLUMNS = [
+    "mua_id",
+    "mua_service_area_name",
+    "designation_type",
+    "mua_component_geographic_type_code",
+    "mua_component_geographic_type_description",
+    "mua_component_geographic_name",
+    "census_tract",
+    "tract_fips",
+    "county_fips",
+    "county_subdiv_fips",
+    "state_and_county_federal_information_processing_standard_code",
+    "common_state_fips_code",
+    "common_state_name",
+    "common_county_name",
+    "common_state_county_fips_code",
+    "primary_state_abbreviation",
+]
+
+
+@dataclass
+class MUAPAssets:
+    designated: pd.DataFrame
+    sites: pd.DataFrame
+    geography: pd.DataFrame
+    tract_lookup: pd.DataFrame
+    county_lookup: pd.DataFrame
+    county_subdivision_lookup: pd.DataFrame
+    boundaries: "gpd.GeoDataFrame | None" = None
+
+
+def standardize_mua_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize MUA/P spreadsheet column names to snake_case aliases."""
+    out = df.copy()
+    out.columns = out.columns.str.lower().str.replace(" ", "_")
+    renamed: dict[str, str] = {}
+    for col in out.columns:
+        new_col = col.replace("mua/p_", "mua_")
+        new_col = new_col.replace("medically_underserved_area/population_(mua/p)_", "mua_")
+        new_col = new_col.replace(
+            "designation_population_in_a_medically_underserved_area/population_(mua/p)",
+            "designation_population_in_a_mua",
+        )
+        new_col = new_col.replace(
+            "medically_underserved_area/population_(mua/p)_withdrawal_date",
+            "mua_withdrawal_date",
+        )
+        new_col = new_col.replace(
+            "medically_underserved_area/population_(mua/p)_withdrawal_date_in_text_format",
+            "mua_withdrawal_date_text",
+        )
+        renamed[col] = new_col
+    return out.rename(columns=renamed)
+
+
+def normalize_county_fips(value: Any) -> str | None:
+    """Return a 5-digit county FIPS string, or None for invalid placeholders."""
+    if pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not re.fullmatch(r"\d+(\.0+)?", text):
+        return None
+    return str(int(float(text))).zfill(5)
+
+
+def parse_census_tract_suffix(tract_raw: Any) -> str | None:
+    """Convert HRSA tract notation (e.g. 4057.00) to a 6-digit tract suffix."""
+    if pd.isna(tract_raw):
+        return None
+    text = str(tract_raw).strip()
+    if text.lower() in {"not applicable", "na", "nan"}:
+        return None
+    if not re.match(r"^[\d.]+$", text):
+        return None
+    if "." in text:
+        major, minor = text.split(".", 1)
+        return major.zfill(4) + minor.ljust(2, "0")[:2].zfill(2)
+    return text.replace(".", "").zfill(6)
+
+
+def build_mua_tract_fips(row: pd.Series) -> str | None:
+    """Build an 11-digit census tract FIPS from county + tract fields."""
+    county5 = normalize_county_fips(
+        row.get("state_and_county_federal_information_processing_standard_code")
+    )
+    suffix = parse_census_tract_suffix(row.get("census_tract"))
+    if county5 and suffix:
+        return county5 + suffix
+    return None
+
+
+def load_designated_mua(path: Path = MUA_DET_XLSX) -> pd.DataFrame:
+    """Load MUA/P detail file and keep only Designated records."""
+    df = standardize_mua_columns(pd.read_excel(path))
+    designated = df[df["mua_status_description"] == "Designated"].copy()
+    designated["tract_fips"] = designated.apply(build_mua_tract_fips, axis=1)
+    designated["county_fips"] = designated[
+        "state_and_county_federal_information_processing_standard_code"
+    ].map(normalize_county_fips)
+    designated["county_subdiv_fips"] = designated["county_subdivision_fips_code"].apply(
+        lambda x: str(int(float(x)))
+        if pd.notna(x) and re.fullmatch(r"\d+(\.0+)?", str(x).strip())
+        else None
+    )
+    return designated
+
+
+def profile_mua_dataset(df: pd.DataFrame) -> dict:
+    """Return a structured profile of MUA/P row counts, keys, dates, and nulls."""
+    date_cols = [
+        c for c in df.columns if "date" in c and df[c].dtype != "datetime64[ns]"
+    ]
+    for col in date_cols:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    completeness = pd.DataFrame(
+        {
+            "column": df.columns,
+            "dtype": df.dtypes.astype(str).values,
+            "non_null": df.notna().sum().values,
+            "null_pct": (100 * df.isna().mean()).round(1).values,
+            "n_unique": df.nunique().values,
+        }
+    ).sort_values("null_pct", ascending=False)
+
+    constant_cols = completeness.loc[completeness["n_unique"] == 1, "column"].tolist()
+    rows_per_site = df.groupby(MUA_SITE_KEY).size()
+    designation_counts = (
+        df.groupby("designation_type")
+        .agg(
+            rows=(MUA_SITE_KEY, "size"),
+            unique_sites=(MUA_SITE_KEY, "nunique"),
+            unique_tracts=("tract_fips", "nunique"),
+        )
+        .sort_values("rows", ascending=False)
+    )
+    component_counts = df["mua_component_geographic_type_description"].value_counts()
+
+    return {
+        "raw_rows": len(df),
+        "unique_sites": df[MUA_SITE_KEY].nunique(),
+        "unique_service_area_names": df["mua_service_area_name"].nunique(),
+        "unique_tract_fips": df["tract_fips"].nunique(),
+        "rows_per_site": rows_per_site.describe().to_dict(),
+        "designation_type_breakdown": designation_counts,
+        "component_type_breakdown": component_counts,
+        "date_ranges": {
+            col: {"min": df[col].min(), "max": df[col].max(), "nulls": int(df[col].isna().sum())}
+            for col in df.columns
+            if "date" in col
+        },
+        "completeness": completeness,
+        "constant_columns": constant_cols,
+        "identifier_notes": {
+            MUA_SITE_KEY: "Primary key for an MUA/P designation (unique within MUA/P data).",
+            "mua_area_code": "Legacy/service area code; links to some shapefile MuaSrcID values.",
+            "tract_fips": (
+                "Derived 11-digit tract FIPS from county + census tract fields; "
+                "may not match current Census geocoder county codes in all states."
+            ),
+            "MuaSrcID": "Shapefile source id (often zero-padded area code, not mua_id).",
+        },
+    }
+
+
+def build_mua_site_table(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per unique MUA/P designation (mua_id)."""
+    site_cols = [c for c in MUA_SITE_COLUMNS if c in df.columns]
+    sites = (
+        df.sort_values(MUA_SITE_KEY)
+        .groupby(MUA_SITE_KEY, as_index=False)[site_cols]
+        .first()
+    )
+    sites["n_geography_rows"] = df.groupby(MUA_SITE_KEY).size().values
+    sites["n_census_tracts"] = (
+        df.loc[df["mua_component_geographic_type_description"] == "Census Tract"]
+        .groupby(MUA_SITE_KEY)
+        .size()
+        .reindex(sites[MUA_SITE_KEY], fill_value=0)
+        .values
+    )
+    return sites.sort_values(["primary_state_abbreviation", "mua_service_area_name"])
+
+
+def build_mua_geography_table(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per MUA/P geographic component."""
+    geo_cols = [c for c in MUA_GEO_COLUMNS if c in df.columns]
+    geo = df[geo_cols].drop_duplicates().copy()
+    component = geo["mua_component_geographic_type_description"]
+    geo["geo_id"] = None
+    geo.loc[component == "Census Tract", "geo_id"] = geo.loc[
+        component == "Census Tract", "tract_fips"
+    ]
+    geo.loc[component == "Single County", "geo_id"] = geo.loc[
+        component == "Single County", "county_fips"
+    ]
+    geo.loc[component == "County Subdivision", "geo_id"] = geo.loc[
+        component == "County Subdivision", "county_subdiv_fips"
+    ]
+    return geo.sort_values([MUA_SITE_KEY, "mua_component_geographic_type_description", "geo_id"])
+
+
+def build_mua_tract_lookup(geography: pd.DataFrame) -> pd.DataFrame:
+    lookup = _aggregate_hpsa_lookup(
+        geography.dropna(subset=["tract_fips"]),
+        "tract_fips",
+        site_key=MUA_SITE_KEY,
+        name_col="mua_service_area_name",
+    )
+    return lookup.rename(columns={"tract_fips": "census_tract_fips"})
+
+
+def build_mua_county_lookup(geography: pd.DataFrame) -> pd.DataFrame:
+    county_rows = geography.loc[
+        geography["mua_component_geographic_type_description"] == "Single County"
+    ]
+    return _aggregate_hpsa_lookup(
+        county_rows,
+        "county_fips",
+        site_key=MUA_SITE_KEY,
+        name_col="mua_service_area_name",
+    )
+
+
+def build_mua_county_subdivision_lookup(geography: pd.DataFrame) -> pd.DataFrame:
+    subdiv_rows = geography.loc[
+        geography["mua_component_geographic_type_description"] == "County Subdivision"
+    ]
+    return _aggregate_hpsa_lookup(
+        subdiv_rows,
+        "county_subdiv_fips",
+        site_key=MUA_SITE_KEY,
+        name_col="mua_service_area_name",
+    )
+
+
+def load_mua_boundaries(path: Path = MUA_BOUNDARIES_SHP) -> "gpd.GeoDataFrame":
+    """Load designated MUA/P designation polygons (MUA_SHP layer)."""
+    if not HAS_GEOPANDAS:
+        raise ImportError("geopandas is required for boundary-based MUA/P checks")
+    gdf = gpd.read_file(path)
+    return gdf.loc[gdf["MuaStatCD"] == "D"].copy()
+
+
+def build_mua_assets(*, load_boundaries: bool = True) -> MUAPAssets:
+    """Load MUA/P spreadsheets, lookup tables, and optional boundary polygons."""
+    if not MUA_DET_XLSX.exists():
+        raise FileNotFoundError(f"MUA/P detail file not found: {MUA_DET_XLSX}")
+
+    designated = load_designated_mua(MUA_DET_XLSX)
+    geography = build_mua_geography_table(designated)
+    boundaries = None
+    if load_boundaries and HAS_GEOPANDAS and MUA_BOUNDARIES_SHP.exists():
+        boundaries = load_mua_boundaries(MUA_BOUNDARIES_SHP)
+
+    return MUAPAssets(
+        designated=designated,
+        sites=build_mua_site_table(designated),
+        geography=geography,
+        tract_lookup=build_mua_tract_lookup(geography),
+        county_lookup=build_mua_county_lookup(geography),
+        county_subdivision_lookup=build_mua_county_subdivision_lookup(geography),
+        boundaries=boundaries,
+    )
+
+
+def write_mua_outputs(assets: MUAPAssets, profile: dict) -> Path:
+    """Write MUA/P CSV outputs and return the output directory."""
+    mua_out = OUTPUT_DIR / "mua"
+    mua_out.mkdir(parents=True, exist_ok=True)
+    assets.sites.to_csv(mua_out / "mua_sites.csv", index=False)
+    assets.geography.to_csv(mua_out / "mua_geography.csv", index=False)
+    assets.tract_lookup.to_csv(mua_out / "mua_tract_lookup.csv", index=False)
+    assets.county_lookup.to_csv(mua_out / "mua_county_lookup.csv", index=False)
+    assets.county_subdivision_lookup.to_csv(
+        mua_out / "mua_county_subdivision_lookup.csv", index=False
+    )
+    profile["completeness"].to_csv(mua_out / "column_completeness.csv", index=False)
+    profile["designation_type_breakdown"].to_csv(
+        mua_out / "designation_type_breakdown.csv"
+    )
+    return mua_out
+
+
+def print_mua_profile_summary(profile: dict) -> None:
+    """Print a human-readable MUA/P profile summary."""
+    print("=" * 72)
+    print("MUA/P — Medically Underserved Areas/Populations (Designated records profile)")
+    print("=" * 72)
+    print(f"Detail rows (geography components): {profile['raw_rows']:,}")
+    print(f"Unique MUA/P designations (mua_id): {profile['unique_sites']:,}")
+    print(f"Unique service area names:          {profile['unique_service_area_names']:,}")
+    print(f"Unique tract FIPS (derived):        {profile['unique_tract_fips']:,}")
+    print()
+    print("Rows per mua_id:")
+    for stat, val in profile["rows_per_site"].items():
+        print(f"  {stat:>6}: {val:,.1f}" if isinstance(val, float) else f"  {stat:>6}: {val}")
+    print()
+    print("By designation type:")
+    print(profile["designation_type_breakdown"].to_string())
+    print()
+    print("By geography component type:")
+    print(profile["component_type_breakdown"].to_string())
+    print()
+    print("Date ranges:")
+    for col, info in profile["date_ranges"].items():
+        print(f"  {col}: {info['min']} → {info['max']}  (nulls: {info['nulls']})")
+    print()
+    print(f"Constant columns ({len(profile['constant_columns'])}): "
+          f"{', '.join(profile['constant_columns'])}")
+    print()
+    high_null = profile["completeness"].loc[profile["completeness"]["null_pct"] > 50]
+    print(f"Columns with >50% nulls ({len(high_null)}):")
+    print(high_null[["column", "null_pct", "n_unique"]].head(15).to_string(index=False))
+    print()
+    print("Identifier notes:")
+    for key, note in profile["identifier_notes"].items():
+        print(f"  {key}: {note}")
+
+
+def _lookup_mua_matches(
+    lookup: pd.DataFrame,
+    geo_col: str,
+    geo_id: str | None,
+) -> dict[str, Any]:
+    """Return MUA/P matches for one geography id from a lookup table."""
+    if not geo_id:
+        return _empty_hpsa_match()
+
+    if geo_col not in lookup.columns:
+        return _empty_hpsa_match()
+
+    hit = lookup.loc[lookup[geo_col] == geo_id]
+    if hit.empty:
+        return _empty_hpsa_match()
+
+    row = hit.iloc[0]
+    return {
+        "hpsa_ids": row["hpsa_ids"],
+        "hpsa_names": row["hpsa_names"],
+        "designation_types": row["designation_types"],
+    }
+
+
+def _mua_matches_from_boundary_hits(hits: "gpd.GeoDataFrame") -> dict[str, Any]:
+    if hits.empty:
+        return _empty_hpsa_match()
+    deduped = hits.drop_duplicates(subset=["MuaSrcID"])
+    return {
+        "hpsa_ids": deduped["MuaSrcID"].tolist(),
+        "hpsa_names": deduped["MuaSvcArNM"].tolist(),
+        "designation_types": deduped["MuaDgnTypD"].tolist(),
+    }
+
+
+def match_point_to_mua_boundaries(
+    longitude: float | None,
+    latitude: float | None,
+    boundaries: "gpd.GeoDataFrame",
+    *,
+    state: str | None = None,
+) -> dict[str, Any]:
+    """Return MUA/P matches for a geocoded point using HRSA MUA_SHP polygons."""
+    if longitude is None or latitude is None:
+        return _empty_hpsa_match()
+
+    polys = boundaries
+    if state:
+        polys = boundaries.loc[boundaries["PriStAbbr"].str.upper() == state.upper()]
+
+    point = _point_geodataframe(longitude, latitude)
+    hits = gpd.sjoin(point, polys, predicate="within")
+    return _mua_matches_from_boundary_hits(hits)
+
+
+def check_address_in_mua(
+    address: str,
+    city: str,
+    state: str,
+    zip_code: str,
+    *,
+    assets: MUAPAssets,
+    geocode: bool = True,
+    geocode_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Determine whether an address falls within a designated MUA/P."""
+    geo = geocode_result or (
+        geocode_address(address, city, state, zip_code) if geocode else {}
+    )
+
+    tract_match = _lookup_mua_matches(
+        assets.tract_lookup, "census_tract_fips", geo.get("census_tract_fips")
+    )
+    county_match = _lookup_mua_matches(
+        assets.county_lookup, "county_fips", geo.get("county_fips")
+    )
+    subdiv_match = _lookup_mua_matches(
+        assets.county_subdivision_lookup,
+        "county_subdiv_fips",
+        geo.get("county_subdivision_fips"),
+    )
+    lookup_match = _merge_hpsa_matches(tract_match, county_match, subdiv_match)
+
+    boundary_match = _empty_hpsa_match()
+    has_boundaries = assets.boundaries is not None
+    if has_boundaries:
+        boundary_match = match_point_to_mua_boundaries(
+            geo.get("longitude"),
+            geo.get("latitude"),
+            assets.boundaries,
+            state=state,
+        )
+
+    if has_boundaries:
+        final_match = boundary_match
+        match_methods = ["mua_polygon"] if boundary_match["hpsa_ids"] else []
+    else:
+        final_match = lookup_match
+        match_methods = []
+        if tract_match["hpsa_ids"]:
+            match_methods.append("census_tract")
+        if county_match["hpsa_ids"]:
+            match_methods.append("county")
+        if subdiv_match["hpsa_ids"]:
+            match_methods.append("county_subdivision")
+
+    lookup_in_mua = bool(lookup_match["hpsa_ids"])
+    boundary_in_mua = bool(boundary_match["hpsa_ids"])
+
+    return {
+        "in_mua": bool(final_match["hpsa_ids"]),
+        "in_mua_lookup": lookup_in_mua,
+        "in_mua_boundary": boundary_in_mua if has_boundaries else None,
+        "lookup_boundary_agree": lookup_in_mua == boundary_in_mua if has_boundaries else None,
+        "match_methods": match_methods,
+        "matched_mua_ids": final_match["hpsa_ids"],
+        "matched_mua_names": final_match["hpsa_names"],
+        "matched_designation_types": final_match["designation_types"],
+        "lookup_matched_mua_names": lookup_match["hpsa_names"],
+        "boundary_matched_mua_names": boundary_match["hpsa_names"]
+        if has_boundaries
+        else None,
+        "used_boundary_layer": has_boundaries,
+    }
+
 
 CENSUS_GEOCODER_URL = (
     "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
@@ -368,15 +843,21 @@ def build_geography_table(df: pd.DataFrame) -> pd.DataFrame:
     return geo.sort_values([SITE_KEY, "hpsa_component_type_description", "geo_id"])
 
 
-def _aggregate_hpsa_lookup(geography: pd.DataFrame, geo_col: str) -> pd.DataFrame:
-    """Build a geo-id → HPSA designation lookup for one geography level."""
+def _aggregate_hpsa_lookup(
+    geography: pd.DataFrame,
+    geo_col: str,
+    *,
+    site_key: str = SITE_KEY,
+    name_col: str = "hpsa_name",
+) -> pd.DataFrame:
+    """Build a geo-id → designation lookup for one geography level."""
     rows = geography.dropna(subset=[geo_col]).copy()
     return (
         rows.groupby(geo_col, as_index=False)
         .agg(
-            n_hpsa_sites=(SITE_KEY, "nunique"),
-            hpsa_ids=(SITE_KEY, lambda s: sorted(s.unique().tolist())),
-            hpsa_names=("hpsa_name", lambda s: sorted(s.unique().tolist())),
+            n_hpsa_sites=(site_key, "nunique"),
+            hpsa_ids=(site_key, lambda s: sorted(s.unique().tolist())),
+            hpsa_names=(name_col, lambda s: sorted(s.unique().tolist())),
             designation_types=("designation_type", lambda s: sorted(s.unique().tolist())),
         )
         .sort_values(geo_col)
@@ -908,11 +1389,13 @@ def check_addresses_in_hpsa(
 def check_addresses_all_domains(
     addresses: pd.DataFrame,
     domain_assets: dict[str, HPSADomainAssets],
+    mua_assets: MUAPAssets | None = None,
 ) -> pd.DataFrame:
     """
-    Geocode each address once, then check HPSA membership across all domains.
+    Geocode each address once, then check HPSA and MUA/P membership.
 
-    Returns a wide dataframe with per-domain ``in_hpsa_{domain_key}`` columns.
+    Returns a wide dataframe with per-domain ``in_hpsa_{domain_key}`` columns and,
+    when ``mua_assets`` is provided, ``in_mua`` / ``matched_mua_names`` columns.
     """
     rows: list[dict[str, Any]] = []
 
@@ -954,6 +1437,26 @@ def check_addresses_all_domains(
 
         record["in_hpsa_any"] = any(
             record[f"in_hpsa_{domain_key}"] for domain_key in domain_assets
+        )
+
+        if mua_assets is not None:
+            mua_check = check_address_in_mua(
+                row["address"],
+                row["city"],
+                row["state"],
+                row["zip"],
+                assets=mua_assets,
+                geocode=False,
+                geocode_result=geo,
+            )
+            record["in_mua"] = mua_check["in_mua"]
+            record["in_mua_lookup"] = mua_check["in_mua_lookup"]
+            record["in_mua_boundary"] = mua_check["in_mua_boundary"]
+            record["lookup_boundary_agree_mua"] = mua_check["lookup_boundary_agree"]
+            record["matched_mua_names"] = mua_check["matched_mua_names"]
+
+        record["in_hpsa_or_mua"] = record["in_hpsa_any"] or (
+            mua_assets is not None and record.get("in_mua", False)
         )
         rows.append(record)
 
@@ -1030,18 +1533,32 @@ Caveats:
   - hpsa_name is not unique (7120 names vs 7666 ids); always key on hpsa_id.
   - hpsa_id is not unique across domains; always include discipline/domain.
   - This analysis supports Primary Care, Dental Health, and Mental Health separately.
+
+MUA/P (Medically Underserved Areas/Populations):
+  - Detail file: MUA_DET.xlsx (component rows); shapefile: MUA_SHP (designation polygons).
+  - Geocode address → point-in-polygon against MUA_SHP for highest confidence.
+  - Spreadsheet tract lookup uses derived tract FIPS; may disagree with geocoder in
+    some states due to county/tract coding differences — prefer MUA_SHP when available.
 """
     )
 
 
-def print_pilot_site_results(results: pd.DataFrame, domain_assets: dict[str, HPSADomainAssets]) -> None:
-    """Print a concise summary of pilot-site HPSA checks across all domains."""
+def print_pilot_site_results(
+    results: pd.DataFrame,
+    domain_assets: dict[str, HPSADomainAssets],
+    *,
+    mua_assets: MUAPAssets | None = None,
+) -> None:
+    """Print a concise summary of pilot-site HPSA and MUA/P checks."""
     print()
     print("=" * 72)
-    print("Community health center pilot sites — HPSA checks (all domains)")
+    print("Community health center pilot sites — HPSA & MUA/P checks")
     print("=" * 72)
     print(f"Sites checked: {len(results)}")
     print(f"In any designated HPSA: {results['in_hpsa_any'].sum()}")
+    if "in_mua" in results.columns:
+        print(f"In designated MUA/P: {results['in_mua'].sum()}")
+        print(f"In HPSA or MUA/P: {results['in_hpsa_or_mua'].sum()}")
     print(f"Geocode failures: {(~results['geocode_success']).sum()}")
     print()
 
@@ -1056,10 +1573,23 @@ def print_pilot_site_results(results: pd.DataFrame, domain_assets: dict[str, HPS
             disagreements = results.loc[results[agree_col] == False]  # noqa: E712
             print(f"  Lookup vs boundary disagreements: {len(disagreements)}")
 
+    if mua_assets is not None and "in_mua" in results.columns:
+        print(
+            f"MUA/P: {results['in_mua'].sum()} in MUA/P "
+            f"({results['in_mua_boundary'].sum()} boundary, {results['in_mua_lookup'].sum()} lookup)"
+        )
+        if results["lookup_boundary_agree_mua"].notna().any():
+            disagreements = results.loc[results["lookup_boundary_agree_mua"] == False]  # noqa: E712
+            print(f"  MUA lookup vs boundary disagreements: {len(disagreements)}")
+
     print()
     display_cols = ["address", "city", "zip", "geocode_success", "in_hpsa_any"]
+    if "in_mua" in results.columns:
+        display_cols.extend(["in_mua", "in_hpsa_or_mua"])
     for domain_key in domain_assets:
         display_cols.append(f"in_hpsa_{domain_key}")
+    if "matched_mua_names" in results.columns:
+        display_cols.append("matched_mua_names")
     for domain_key in domain_assets:
         display_cols.append(f"matched_hpsa_names_{domain_key}")
     print(results[display_cols].to_string(index=False))
@@ -1106,13 +1636,39 @@ def main() -> None:
         assert assets.sites[SITE_KEY].is_unique
         assert len(assets.sites) == assets.designated[SITE_KEY].nunique()
 
+    print()
+    print("=" * 72)
+    print("MUA/P analysis")
+    print("=" * 72)
+
+    mua_assets: MUAPAssets | None = None
+    if MUA_DET_XLSX.exists():
+        mua_assets = build_mua_assets(load_boundaries=HAS_GEOPANDAS)
+        mua_profile = profile_mua_dataset(mua_assets.designated)
+        print_mua_profile_summary(mua_profile)
+        mua_out = write_mua_outputs(mua_assets, mua_profile)
+        print()
+        print(f"Output tables written to: {mua_out}")
+        print(f"  mua_sites.csv     — {len(mua_assets.sites):,} unique MUA/P designations")
+        print(f"  mua_geography.csv — {len(mua_assets.geography):,} geography components")
+        print(f"  mua_tract_lookup.csv — {len(mua_assets.tract_lookup):,} census tracts")
+        if mua_assets.boundaries is not None:
+            print(f"  MUA_SHP polygons loaded: {len(mua_assets.boundaries):,}")
+        assert mua_assets.sites[MUA_SITE_KEY].is_unique
+    else:
+        print(f"MUA/P detail file not found: {MUA_DET_XLSX}")
+
     print_linking_guidance()
 
     if PILOT_SITES_PATH.exists():
         pilot_sites = load_pilot_sites(PILOT_SITES_PATH)
-        pilot_results = check_addresses_all_domains(pilot_sites, domain_assets)
+        pilot_results = check_addresses_all_domains(
+            pilot_sites, domain_assets, mua_assets=mua_assets
+        )
         pilot_results.to_csv(OUTPUT_DIR / "pilot_sites_hpsa_check.csv", index=False)
-        print_pilot_site_results(pilot_results, domain_assets)
+        print_pilot_site_results(
+            pilot_results, domain_assets, mua_assets=mua_assets
+        )
         print()
         print("Pilot site results written to:", OUTPUT_DIR / "pilot_sites_hpsa_check.csv")
     else:
