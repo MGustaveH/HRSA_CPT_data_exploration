@@ -34,7 +34,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 HPSA_BASE = Path(
     "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
-    "/My Drive/CesarK_CPT_project/data/key_data_sources/data_samples"
+    "/My Drive/CesarK_CPT_project/data/key_data_sources"
     "/HPSA MUAP Sites"
 )
 OUTPUT_DIR = Path(__file__).parent / "output"

@@ -21,7 +21,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 DATA_PATH = Path(
     "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
-    "/My Drive/CesarK_CPT_project/data/key_data_sources/data_samples"
+    "/My Drive/CesarK_CPT_project/data/key_data_sources"
     "/Healthcare Occupations Supply Demand/Workforce_Projections_FullData.xlsx"
 )
 DATA_SHEET = "Stacked FY2025"
