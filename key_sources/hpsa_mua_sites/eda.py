@@ -30,7 +30,10 @@ except ImportError:
     HAS_GEOPANDAS = False
 
 # ---------------------------------------------------------------------------
-# Paths and domain configuration
+# Paths and HPSA domain configuration
+#
+# HPSA data lives in three parallel folders (Primary Care, Dental, Mental Health).
+# Each folder has a detail spreadsheet plus a boundaries/ subfolder with shapefiles.
 # ---------------------------------------------------------------------------
 HPSA_BASE = Path(
     "/Users/karlhonerlaw/Library/CloudStorage/GoogleDrive-honerlaw@gmail.com"
@@ -69,6 +72,8 @@ HPSA_DOMAINS: dict[str, dict[str, str]] = {
 
 @dataclass
 class HPSADomainPaths:
+    """File paths for one HPSA occupational domain (spreadsheet + shapefiles)."""
+
     key: str
     label: str
     discipline_class: str
@@ -80,6 +85,8 @@ class HPSADomainPaths:
 
 @dataclass
 class HPSADomainAssets:
+    """Everything loaded for one HPSA domain: tables for profiling + layers for address checks."""
+
     paths: HPSADomainPaths
     designated: pd.DataFrame
     sites: pd.DataFrame
@@ -126,6 +133,13 @@ def get_domain_paths(domain_key: str) -> HPSADomainPaths:
     )
 
 
+# ---------------------------------------------------------------------------
+# MUA/P (Medically Underserved Areas/Populations)
+#
+# Structure mirrors HPSA: MUA_DET.xlsx has one row per geography component,
+# MUA_SHP has one polygon per whole designation. Unlike HPSA, there are no
+# facility/point designations for MUA/P.
+# ---------------------------------------------------------------------------
 MUA_DIR = HPSA_BASE / "Medically Underserved Areas Populations (MUA P)"
 MUA_DET_XLSX = MUA_DIR / "MUA_DET.xlsx"
 MUA_BOUNDARIES_SHP = MUA_DIR / "MUA_SHP/MUA_SHP_DET_CUR_VX.shp"
@@ -177,6 +191,8 @@ MUA_GEO_COLUMNS = [
 
 @dataclass
 class MUAPAssets:
+    """Loaded MUA/P tables and optional MUA_SHP polygons for address checks."""
+
     designated: pd.DataFrame
     sites: pd.DataFrame
     geography: pd.DataFrame
@@ -250,6 +266,7 @@ def load_designated_mua(path: Path = MUA_DET_XLSX) -> pd.DataFrame:
     """Load MUA/P detail file and keep only Designated records."""
     df = standardize_mua_columns(pd.read_excel(path))
     designated = df[df["mua_status_description"] == "Designated"].copy()
+    # Derive joinable FIPS codes; used by exported lookup CSVs (fallback path only).
     designated["tract_fips"] = designated.apply(build_mua_tract_fips, axis=1)
     designated["county_fips"] = designated[
         "state_and_county_federal_information_processing_standard_code"
@@ -321,7 +338,11 @@ def profile_mua_dataset(df: pd.DataFrame) -> dict:
 
 
 def build_mua_site_table(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per unique MUA/P designation (mua_id)."""
+    """One row per unique MUA/P designation (mua_id).
+
+    The detail file has many rows per mua_id (one per census tract/county/etc.).
+    This collapses to site-level attributes plus counts of component rows.
+    """
     site_cols = [c for c in MUA_SITE_COLUMNS if c in df.columns]
     sites = (
         df.sort_values(MUA_SITE_KEY)
@@ -475,6 +496,12 @@ def print_mua_profile_summary(profile: dict) -> None:
         print(f"  {key}: {note}")
 
 
+# ---------------------------------------------------------------------------
+# MUA/P address matching
+#
+# Preferred: point-in-polygon against MUA_SHP designation polygons.
+# Fallback: join geocoded tract/county/subdivision FIPS to exported lookup CSVs.
+# ---------------------------------------------------------------------------
 def _lookup_mua_matches(
     lookup: pd.DataFrame,
     geo_col: str,
@@ -500,6 +527,7 @@ def _lookup_mua_matches(
 
 
 def _mua_matches_from_boundary_hits(hits: "gpd.GeoDataFrame") -> dict[str, Any]:
+    """Convert spatial-join rows to a deduplicated list of MUA designations."""
     if hits.empty:
         return _empty_hpsa_match()
     deduped = hits.drop_duplicates(subset=["MuaSrcID"])
@@ -553,6 +581,7 @@ def check_address_in_mua(
     match_methods: list[str] = []
 
     if assets.boundaries is not None:
+        # Shapefile path: lat/lon → polygon contains check (authoritative for MUA/P).
         final_match = match_point_to_mua_boundaries(
             geo.get("longitude"),
             geo.get("latitude"),
@@ -562,6 +591,7 @@ def check_address_in_mua(
         if final_match["hpsa_ids"]:
             match_methods.append("mua_polygon")
     else:
+        # Fallback: match geocoder FIPS codes against spreadsheet-derived lookups.
         tract_match = _lookup_mua_matches(
             assets.tract_lookup, "census_tract_fips", geo.get("census_tract_fips")
         )
@@ -590,13 +620,12 @@ def check_address_in_mua(
     }
 
 
-CENSUS_GEOCODER_URL = (
-    "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
-)
-GEOCODER_BENCHMARK = "Public_AR_Current"
-GEOCODER_VINTAGE = "Current_Current"
-GEOCODER_SLEEP_SECONDS = 0.25
-
+# ---------------------------------------------------------------------------
+# HPSA spreadsheet processing
+#
+# Detail spreadsheets have one row per geography component. We collapse those
+# into site-level tables, geography tables, and tract/county lookup CSVs.
+# ---------------------------------------------------------------------------
 SITE_KEY = "hpsa_id"
 
 # Site-level attributes (constant within each hpsa_id).
@@ -821,6 +850,8 @@ def build_geography_table(df: pd.DataFrame) -> pd.DataFrame:
     )
     geo["geo_id"] = geo["geo_id_raw"].astype(str)
 
+    # HRSA encodes component type in hpsa_component_type_description; geo_id holds
+    # the FIPS code (or the literal "POINT" for facility designations).
     component = geo["hpsa_component_type_description"]
     geo["census_tract_fips"] = geo["geo_id"].where(component == "Census Tract")
     geo["county_fips"] = geo["geo_id"].where(component == "Single County")
@@ -882,6 +913,21 @@ def load_pilot_sites(path: Path = PILOT_SITES_PATH) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+CENSUS_GEOCODER_URL = (
+    "https://geocoding.geo.census.gov/geocoder/geographies/onelineaddress"
+)
+GEOCODER_BENCHMARK = "Public_AR_Current"
+GEOCODER_VINTAGE = "Current_Current"
+GEOCODER_SLEEP_SECONDS = 0.25
+
+
+# ---------------------------------------------------------------------------
+# Geocoding (Census Bureau API)
+#
+# Converts street addresses to lat/lon plus census tract, county, and
+# county-subdivision FIPS. Used once per pilot address, then reused for all
+# HPSA domain checks and MUA/P checks.
+# ---------------------------------------------------------------------------
 def format_oneline_address(
     address: str, city: str, state: str, zip_code: str
 ) -> str:
@@ -968,6 +1014,12 @@ def geocode_address(
     }
 
 
+# ---------------------------------------------------------------------------
+# HPSA address matching helpers
+#
+# Two designation models: area (tract/county polygons) and facility (POINT rows
+# or facility shapefile points). Matches from both paths are merged by hpsa_id.
+# ---------------------------------------------------------------------------
 def _lookup_hpsa_matches(
     lookup: pd.DataFrame,
     geo_col: str,
@@ -1076,6 +1128,12 @@ def _empty_hpsa_match() -> dict[str, list[Any]]:
     return {"hpsa_ids": [], "hpsa_names": [], "designation_types": []}
 
 
+# ---------------------------------------------------------------------------
+# HPSA boundary shapefiles (geopandas)
+#
+# CMP* layers = area component polygons; PNT* layers = facility point locations.
+# Both are filtered to Designated records for the current occupational domain.
+# ---------------------------------------------------------------------------
 def load_area_hpsa_boundaries(
     path: Path,
     discipline_class: str,
@@ -1199,6 +1257,7 @@ def match_point_to_facility_boundaries(
     if longitude is None or latitude is None:
         return _empty_hpsa_match()
 
+    # Project to a meter-based CRS so nearest-neighbor distance is meaningful.
     point = _point_geodataframe(longitude, latitude)
     projected_point = point.to_crs("EPSG:5070")
     projected_facilities = facility_boundaries.to_crs("EPSG:5070")
@@ -1243,6 +1302,7 @@ def check_address_in_hpsa(
 
     match_methods: list[str] = []
 
+    # --- Area designations (Population / Geographic / High Needs Geographic) ---
     if area_boundaries is not None:
         area_match = match_point_to_area_boundaries(
             geo.get("longitude"),
@@ -1272,6 +1332,7 @@ def check_address_in_hpsa(
         if subdiv_match["hpsa_ids"]:
             match_methods.append("county_subdivision")
 
+    # --- Facility designations (FQHC, RHC, etc.) ---
     if facility_boundaries is not None:
         facility_match = match_point_to_facility_boundaries(
             geo.get("longitude"),
@@ -1293,6 +1354,7 @@ def check_address_in_hpsa(
     else:
         facility_match = _empty_hpsa_match()
 
+    # Union area + facility matches; an address can hit both types.
     all_match = _merge_hpsa_matches(area_match, facility_match)
 
     return {
@@ -1352,6 +1414,7 @@ def check_addresses_all_domains(
     rows: list[dict[str, Any]] = []
 
     for _, row in addresses.iterrows():
+        # One geocode call per address; pass geocode_result into each domain check.
         geo = geocode_address(row["address"], row["city"], row["state"], row["zip"])
         record: dict[str, Any] = {
             "address": row["address"],
@@ -1367,6 +1430,7 @@ def check_addresses_all_domains(
         }
 
         for domain_key, assets in domain_assets.items():
+            # Each occupational domain (PC / Dental / MH) is checked independently.
             check = check_address_in_hpsa(
                 row["address"],
                 row["city"],
@@ -1546,6 +1610,7 @@ def main() -> None:
 
     domain_assets: dict[str, HPSADomainAssets] = {}
 
+    # Step 1: Profile each HPSA domain and write deduplicated CSV tables.
     for domain_key in HPSA_DOMAINS:
         print()
         assets = build_domain_assets(domain_key, load_boundaries=HAS_GEOPANDAS)
@@ -1579,6 +1644,7 @@ def main() -> None:
         assert assets.sites[SITE_KEY].is_unique
         assert len(assets.sites) == assets.designated[SITE_KEY].nunique()
 
+    # Step 2: Profile MUA/P data and write lookup tables + optional shapefile info.
     print()
     print("=" * 72)
     print("MUA/P analysis")
@@ -1601,8 +1667,10 @@ def main() -> None:
     else:
         print(f"MUA/P detail file not found: {MUA_DET_XLSX}")
 
+    # Step 3: Print join guidance for downstream job/site linkage.
     print_linking_guidance()
 
+    # Step 4: Geocode pilot CHC addresses and check HPSA + MUA/P membership.
     if PILOT_SITES_PATH.exists():
         pilot_sites = load_pilot_sites(PILOT_SITES_PATH)
         pilot_results = check_addresses_all_domains(
