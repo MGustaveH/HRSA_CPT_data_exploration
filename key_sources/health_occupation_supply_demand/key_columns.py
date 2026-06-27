@@ -175,7 +175,84 @@ len(df_filtered_sd)
 df_filtered_sd.head()
 
 fig = px.line(df_filtered_sd, x="year", y="value", color="type", line_dash = 'Profession')
-plot(fig)
+plot(fig, filename='NP_dis_agg.html')
 
 # Takeaway: these look to be distinct, perhaps we combine their values into a "Total" group
 
+
+# High Level Thoughts on How to Account for some Professions Sharing a Profession Definition
+# And therefore being so similar as to likely map to the same roles in the CPT 
+
+# I don't think I want to create records in the table... 
+# Instead I want to create a function which can flexibly handle a user's needs 
+
+# filter to Total Population 
+df_filtered = df[df["State"] == "Total"].copy()
+len(df_filtered)
+df_filtered = df_filtered[df_filtered["Rurality"] == "Total"].copy()
+len(df_filtered)
+
+# Create a Profession column which does not include designations in parenthases (i.e. "(LTC)", "(PC)", "(WH)")
+# problem... what if this changes or isn't the right pattern? 
+# working from the definitions is probably safer 
+
+# subset to the correct columns and reshape to long format for plotting
+df_filtered.columns
+df_filtered_sd = df_filtered[["Year", 'Profession Definition', "FTE Supply Projections - Supply", "FTE Demand Projections - Demand"]].copy()
+
+# rename columns 
+df_filtered_sd = df_filtered_sd.rename(columns={"Year": "year", "Profession Definition":'pd', "FTE Supply Projections - Supply": "supply", "FTE Demand Projections - Demand": "demand"})
+len(df_filtered_sd)
+
+# groupby year and 'Profession Definition' and calculate the sum of supply and demand
+df_filtered_sd_grp = df_filtered_sd.groupby(['year', 'pd']).agg('sum').reset_index()
+df_filtered_sd_grp.head()
+len(df_filtered_sd_grp)
+df_filtered_sd_grp.columns
+
+
+# For each Profession Definition, make a list of associated professions 
+df_pd_profs = pd.DataFrame()
+for p in df_filtered['Profession Definition'].unique(): 
+    df_temp = df_filtered[df_filtered['Profession Definition'] == p].copy()
+    df_temp_profs = list(df_temp['Profession'].unique())
+
+    # make a dataframe and concat onto df_pd_profs
+    df_pd_prof = pd.DataFrame()
+    df_pd_prof['pd'] = [p]
+    df_pd_prof['Profession'] = [df_temp_profs]
+    df_pd_prof['prof_ct'] = [len(df_temp_profs)]
+
+
+    df_pd_profs = pd.concat([df_pd_profs, df_pd_prof])
+
+len(df_pd_profs)
+df_pd_profs['prof_ct'].value_counts(dropna=False)
+
+df_pd_profs = df_pd_profs.sort_values(by = 'prof_ct', ascending = False)
+df_pd_profs['Profession'].head()
+
+# save 'Profession' lists as string 
+df_pd_profs['Profession'] = df_pd_profs['Profession'].astype('str')
+df_pd_profs['Profession'].head()
+
+# join df_pd_profs onto df_filtered_sd_grp on df 
+len(df_filtered_sd_grp)
+df_filtered_sd_grp = df_filtered_sd_grp.merge(df_pd_profs, on = 'pd', how = 'left')
+len(df_filtered_sd_grp)
+df_filtered_sd_grp.columns
+
+# subset to key columns 
+df_filtered_sd_grp_sub = df_filtered_sd_grp[['year', 'Profession', 'supply', 'demand']]
+
+# reshape to long format for plotting
+df_filtered_sd_grp_mlt = df_filtered_sd_grp_sub.melt(id_vars=["year", 'Profession'], var_name="type", value_name="value")
+len(df_filtered_sd_grp_mlt)
+df_filtered_sd_grp_mlt.head()
+
+fig = px.line(df_filtered_sd_grp_mlt, x="year", y="value", color="Profession", line_dash = 'type')
+plot(fig, filename='agg.html')
+
+# Takeaway: 
+# Combining by definition works well
+# When checking the sum of supply/demand values for Nurse Practicioner, these tie out 
