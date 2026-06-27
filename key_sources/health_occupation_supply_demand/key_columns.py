@@ -256,3 +256,28 @@ plot(fig, filename='agg.html')
 # Takeaway: 
 # Combining by definition works well
 # When checking the sum of supply/demand values for Nurse Practicioner, these tie out 
+
+# One final check, make sure Professions with a single definition's numbers also tie out 
+
+# filter data 
+df_filtered = df[df["State"] == "Total"].copy()
+len(df_filtered)
+
+df_filtered = df_filtered[df_filtered["Rurality"] == "Total"].copy()
+len(df_filtered)
+
+# subset to the correct columns and reshape to long format for plotting
+df_filtered.columns
+df_filtered_sd = df_filtered[["Year", "Profession", "FTE Supply Projections - Supply", "FTE Demand Projections - Demand"]].copy()
+
+df_filtered_sd = df_filtered_sd.rename(columns={"Year": "year", "FTE Supply Projections - Supply": "supply", "FTE Demand Projections - Demand": "demand"})
+len(df_filtered_sd)
+
+# reshape to long format for plotting
+df_filtered_sd = df_filtered_sd.melt(id_vars=["year", "Profession"], var_name="type", value_name="value")
+len(df_filtered_sd)
+df_filtered_sd.head()
+
+fig = px.line(df_filtered_sd, x="year", y="value", color="Profession", line_dash = 'type')
+plot(fig, filename='dis_agg_check.html')
+# Yep, looks good 
