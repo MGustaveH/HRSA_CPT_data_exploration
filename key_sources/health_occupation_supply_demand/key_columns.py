@@ -65,7 +65,9 @@ plot(fig)
 fig = px.line(df_filtered, x="Year", y="Percent Adequacy")
 plot(fig)
 
-
+########################################################
+# Percent Adequacy Across All Professions
+########################################################
 
 # percent adequacy across all professions
 df_filtered = df[df["Profession Group"] == "All Health Workforce"].copy()
@@ -84,6 +86,16 @@ plot(fig)
 ########################################################
 # Explore Profession Group and Professions
 ########################################################
+
+# 2026.06.29 note: I was thinking that we need to group by Profession Definition, 
+# but on second thought I am not sure if this would be double counting the data inside a profession group
+# For example, for:
+# Nurse Practitioners
+# Nurse Practitioners (PC)
+# Nurse Practitioners (WH)
+# I'm not 100% sure whether Nurse Practitioners is the absolute total and PC and WH are subsets (and the remaining amount is spread across other groups) 
+# Or whether PC and WH are in addition to what we see in the "All Health Workforce" group
+# Regardless, I think a simpler solution is probably correct for the CPT team's needs
 
 len(df['Profession Group Definition'].unique())
 len(df['Profession Group'].unique())
@@ -131,7 +143,6 @@ len(df_sing_def_mult_prof)
 # subset to professions that have definitions in df_sing_def_mult_prof
 df_prof_sharing_def = df_dedup_definition[df_dedup_definition['Profession Definition'].isin(df_sing_def_mult_prof['Profession Definition'])]
 len(df_prof_sharing_def)
-df_prof_sharing_def.head()
 
 # sort by 'Profession Definition'
 df_prof_sharing_def = df_prof_sharing_def.sort_values(by = 'Profession Definition')
@@ -184,7 +195,7 @@ plot(fig, filename='NP_dis_agg.html')
 # And therefore being so similar as to likely map to the same roles in the CPT 
 
 # I don't think I want to create records in the table... 
-# Instead I want to create a function which can flexibly handle a user's needs 
+# Instead I want to create a function (instructions) which can flexibly handle a user's needs, this will likely be a better fit for the engineering team
 
 # filter to Total Population 
 df_filtered = df[df["State"] == "Total"].copy()
@@ -192,7 +203,7 @@ len(df_filtered)
 df_filtered = df_filtered[df_filtered["Rurality"] == "Total"].copy()
 len(df_filtered)
 
-# Create a Profession column which does not include designations in parenthases (i.e. "(LTC)", "(PC)", "(WH)")
+# Idea: Create a Profession column which does not include designations in parenthases (i.e. "(LTC)", "(PC)", "(WH)")
 # problem... what if this changes or isn't the right pattern? 
 # working from the definitions is probably safer 
 
@@ -234,7 +245,17 @@ df_pd_profs['Profession'].head()
 
 # save 'Profession' lists as string 
 df_pd_profs['Profession'] = df_pd_profs['Profession'].astype('str')
+df_pd_profs['Profession'].head(10)
+
+for p in df_pd_profs['Profession'].head(10):
+    print(p)
+
+# remove the brackets "[", "]", and apostrophes "'"
+df_pd_profs['Profession'] = df_pd_profs['Profession'].str.replace('[', '', regex=False)
+df_pd_profs['Profession'] = df_pd_profs['Profession'].str.replace(']', '', regex=False)
+df_pd_profs['Profession'] = df_pd_profs['Profession'].str.replace("'", '', regex=False)
 df_pd_profs['Profession'].head()
+len(df_pd_profs)
 
 # join df_pd_profs onto df_filtered_sd_grp on df 
 len(df_filtered_sd_grp)
@@ -249,6 +270,11 @@ df_filtered_sd_grp_sub = df_filtered_sd_grp[['year', 'Profession', 'supply', 'de
 df_filtered_sd_grp_mlt = df_filtered_sd_grp_sub.melt(id_vars=["year", 'Profession'], var_name="type", value_name="value")
 len(df_filtered_sd_grp_mlt)
 df_filtered_sd_grp_mlt.head()
+
+# sort by 'Profession'
+len(df_filtered_sd_grp_mlt)
+df_filtered_sd_grp_mlt = df_filtered_sd_grp_mlt.sort_values(by = ['year', 'Profession']).copy()
+len(df_filtered_sd_grp_mlt)
 
 fig = px.line(df_filtered_sd_grp_mlt, x="year", y="value", color="Profession", line_dash = 'type')
 plot(fig, filename='agg.html')
