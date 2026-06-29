@@ -65,6 +65,34 @@ plot(fig)
 fig = px.line(df_filtered, x="Year", y="Percent Adequacy")
 plot(fig)
 
+
+########################################################
+# Supply and Demand Across All Professions
+########################################################
+
+# supply and demand across all professions
+df_filtered = df[df["Profession Group"] == "All Health Workforce"].copy()
+len(df_filtered)
+
+df_filtered = df_filtered[df_filtered["State"] == "Total"].copy()
+len(df_filtered)
+
+df_filtered = df_filtered[df_filtered["Rurality"] == "Total"].copy()
+len(df_filtered)
+
+# reshape to long format for plotting
+df_filtered_sd = df_filtered[["Year", "FTE Supply Projections - Supply", "FTE Demand Projections - Demand", "Profession"]].copy()
+len(df_filtered_sd)
+
+df_filtered_sd = df_filtered_sd.rename(columns={"Year": "year", "FTE Supply Projections - Supply": "supply", "FTE Demand Projections - Demand": "demand"})
+len(df_filtered_sd)
+
+df_filtered_sd = df_filtered_sd.melt(id_vars=["year", "Profession"], var_name="type", value_name="value")
+len(df_filtered_sd)
+
+fig = px.line(df_filtered_sd, x="year", y="value", color="Profession", line_dash = "type")
+plot(fig, filename="supply_demand_all_professions.html")
+
 ########################################################
 # Percent Adequacy Across All Professions
 ########################################################
@@ -80,230 +108,4 @@ df_filtered = df_filtered[df_filtered["Rurality"] == "Total"].copy()
 len(df_filtered)
 
 fig = px.line(df_filtered, x="Year", y="Percent Adequacy", color="Profession")
-plot(fig)
-
-
-########################################################
-# Explore Profession Group and Professions
-########################################################
-
-# 2026.06.29 note: I was thinking that we need to group by Profession Definition, 
-# but on second thought I am not sure if this would be double counting the data inside a profession group
-# For example, for:
-# Nurse Practitioners
-# Nurse Practitioners (PC)
-# Nurse Practitioners (WH)
-# I'm not 100% sure whether Nurse Practitioners is the absolute total and PC and WH are subsets (and the remaining amount is spread across other groups) 
-# Or whether PC and WH are in addition to what we see in the "All Health Workforce" group
-# Regardless, I think a simpler solution is probably correct for the CPT team's needs
-
-len(df['Profession Group Definition'].unique())
-len(df['Profession Group'].unique())
-
-# print unique Profession Group Definition values 
-for pg in df['Profession Group'].unique():
-    print(pg)
-    print(df[df['Profession Group'] == pg]['Profession Group Definition'].values[0])
-    print("-" * 100)
-
-
-# Do any Professions appear in multiple Profession Groups?
-df_dedup = df[['Profession', 'Profession Group']].drop_duplicates().sort_values('Profession')
-len(df_dedup)
-
-# count the number of times a Profession appears in the df
-df_dedup['Profession'].value_counts(dropna=False)
-df_dedup['Profession'].value_counts(dropna=False).value_counts(dropna=False)
-
-# Takeaway: every profession only appears once 
-
-
-# Relationship between Profession and Profession Definition 
-len(df['Profession'].unique())
-len(df['Profession Definition'].unique())
-
-# Takeaway: Some Professions must share definitions 
-
-# count the number of Profession Definitions for each Profession
-df_dedup_definition = df[['Profession', 'Profession Definition']].drop_duplicates()
-len(df_dedup_definition)
-
-df_dedup_definition['Profession Definition'].value_counts(dropna=False)
-df_dedup_definition['Profession Definition'].value_counts(dropna=False).value_counts(dropna=False)
-
-# subset to definitions which appear multiple times 
-df_dedup_definition_def_cts = df_dedup_definition.groupby('Profession Definition').count().reset_index().rename(columns = {'Profession':'def_ct'})
-df_dedup_definition_def_cts.head()
-df_dedup_definition_def_cts = df_dedup_definition_def_cts.sort_values(by = 'def_ct', ascending = False)
-
-# filter to the 'Profession Definition' that have a def_ct > 1 
-df_sing_def_mult_prof = df_dedup_definition_def_cts[df_dedup_definition_def_cts['def_ct'] > 1].copy()
-len(df_sing_def_mult_prof)
-
-# subset to professions that have definitions in df_sing_def_mult_prof
-df_prof_sharing_def = df_dedup_definition[df_dedup_definition['Profession Definition'].isin(df_sing_def_mult_prof['Profession Definition'])]
-len(df_prof_sharing_def)
-
-# sort by 'Profession Definition'
-df_prof_sharing_def = df_prof_sharing_def.sort_values(by = 'Profession Definition')
-
-# print these Professions 
-for prof in df_prof_sharing_def['Profession']: 
-    print(prof)
-
-
-#############################################
-# Determine How to Handle Professions which appear in multiple Profession Groups
-# e.g.
-# Nurse Practitioners
-# Nurse Practitioners (PC)
-# Nurse Practitioners (WH)
-#############################################
-
-# Let's start by exploring their supply/demand 
-
-# filter data 
-len(df)
-df_filtered = df[df["Profession"].isin(["Nurse Practitioners", "Nurse Practitioners (PC)", "Nurse Practitioners (WH)"])].copy()
-len(df_filtered)
-
-df_filtered = df_filtered[df_filtered["State"] == "Total"].copy()
-len(df_filtered)
-
-df_filtered = df_filtered[df_filtered["Rurality"] == "Total"].copy()
-len(df_filtered)
-
-# subset to the correct columns and reshape to long format for plotting
-df_filtered.columns
-df_filtered_sd = df_filtered[["Year", 'Profession', "FTE Supply Projections - Supply", "FTE Demand Projections - Demand"]].copy()
-
-df_filtered_sd = df_filtered_sd.rename(columns={"Year": "year", "FTE Supply Projections - Supply": "supply", "FTE Demand Projections - Demand": "demand"})
-len(df_filtered_sd)
-
-# reshape to long format for plotting
-df_filtered_sd = df_filtered_sd.melt(id_vars=["year", 'Profession'], var_name="type", value_name="value")
-len(df_filtered_sd)
-df_filtered_sd.head()
-
-fig = px.line(df_filtered_sd, x="year", y="value", color="type", line_dash = 'Profession')
-plot(fig, filename='NP_dis_agg.html')
-
-# Takeaway: these look to be distinct, perhaps we combine their values into a "Total" group
-
-
-# High Level Thoughts on How to Account for some Professions Sharing a Profession Definition
-# And therefore being so similar as to likely map to the same roles in the CPT 
-
-# I don't think I want to create records in the table... 
-# Instead I want to create a function (instructions) which can flexibly handle a user's needs, this will likely be a better fit for the engineering team
-
-# filter to Total Population 
-df_filtered = df[df["State"] == "Total"].copy()
-len(df_filtered)
-df_filtered = df_filtered[df_filtered["Rurality"] == "Total"].copy()
-len(df_filtered)
-
-# Idea: Create a Profession column which does not include designations in parenthases (i.e. "(LTC)", "(PC)", "(WH)")
-# problem... what if this changes or isn't the right pattern? 
-# working from the definitions is probably safer 
-
-# subset to the correct columns and reshape to long format for plotting
-df_filtered.columns
-df_filtered_sd = df_filtered[["Year", 'Profession Definition', "FTE Supply Projections - Supply", "FTE Demand Projections - Demand"]].copy()
-
-# rename columns 
-df_filtered_sd = df_filtered_sd.rename(columns={"Year": "year", "Profession Definition":'pd', "FTE Supply Projections - Supply": "supply", "FTE Demand Projections - Demand": "demand"})
-len(df_filtered_sd)
-
-# groupby year and 'Profession Definition' and calculate the sum of supply and demand
-df_filtered_sd_grp = df_filtered_sd.groupby(['year', 'pd']).agg('sum').reset_index()
-df_filtered_sd_grp.head()
-len(df_filtered_sd_grp)
-df_filtered_sd_grp.columns
-
-
-# For each Profession Definition, make a list of associated professions 
-df_pd_profs = pd.DataFrame()
-for p in df_filtered['Profession Definition'].unique(): 
-    df_temp = df_filtered[df_filtered['Profession Definition'] == p].copy()
-    df_temp_profs = list(df_temp['Profession'].unique())
-
-    # make a dataframe and concat onto df_pd_profs
-    df_pd_prof = pd.DataFrame()
-    df_pd_prof['pd'] = [p]
-    df_pd_prof['Profession'] = [df_temp_profs]
-    df_pd_prof['prof_ct'] = [len(df_temp_profs)]
-
-
-    df_pd_profs = pd.concat([df_pd_profs, df_pd_prof])
-
-len(df_pd_profs)
-df_pd_profs['prof_ct'].value_counts(dropna=False)
-
-df_pd_profs = df_pd_profs.sort_values(by = 'prof_ct', ascending = False)
-df_pd_profs['Profession'].head()
-
-# save 'Profession' lists as string 
-df_pd_profs['Profession'] = df_pd_profs['Profession'].astype('str')
-df_pd_profs['Profession'].head(10)
-
-for p in df_pd_profs['Profession'].head(10):
-    print(p)
-
-# remove the brackets "[", "]", and apostrophes "'"
-df_pd_profs['Profession'] = df_pd_profs['Profession'].str.replace('[', '', regex=False)
-df_pd_profs['Profession'] = df_pd_profs['Profession'].str.replace(']', '', regex=False)
-df_pd_profs['Profession'] = df_pd_profs['Profession'].str.replace("'", '', regex=False)
-df_pd_profs['Profession'].head()
-len(df_pd_profs)
-
-# join df_pd_profs onto df_filtered_sd_grp on df 
-len(df_filtered_sd_grp)
-df_filtered_sd_grp = df_filtered_sd_grp.merge(df_pd_profs, on = 'pd', how = 'left')
-len(df_filtered_sd_grp)
-df_filtered_sd_grp.columns
-
-# subset to key columns 
-df_filtered_sd_grp_sub = df_filtered_sd_grp[['year', 'Profession', 'supply', 'demand']]
-
-# reshape to long format for plotting
-df_filtered_sd_grp_mlt = df_filtered_sd_grp_sub.melt(id_vars=["year", 'Profession'], var_name="type", value_name="value")
-len(df_filtered_sd_grp_mlt)
-df_filtered_sd_grp_mlt.head()
-
-# sort by 'Profession'
-len(df_filtered_sd_grp_mlt)
-df_filtered_sd_grp_mlt = df_filtered_sd_grp_mlt.sort_values(by = ['year', 'Profession']).copy()
-len(df_filtered_sd_grp_mlt)
-
-fig = px.line(df_filtered_sd_grp_mlt, x="year", y="value", color="Profession", line_dash = 'type')
-plot(fig, filename='agg.html')
-
-# Takeaway: 
-# Combining by definition works well
-# When checking the sum of supply/demand values for Nurse Practicioner, these tie out 
-
-# One final check, make sure Professions with a single definition's numbers also tie out 
-
-# filter data 
-df_filtered = df[df["State"] == "Total"].copy()
-len(df_filtered)
-
-df_filtered = df_filtered[df_filtered["Rurality"] == "Total"].copy()
-len(df_filtered)
-
-# subset to the correct columns and reshape to long format for plotting
-df_filtered.columns
-df_filtered_sd = df_filtered[["Year", "Profession", "FTE Supply Projections - Supply", "FTE Demand Projections - Demand"]].copy()
-
-df_filtered_sd = df_filtered_sd.rename(columns={"Year": "year", "FTE Supply Projections - Supply": "supply", "FTE Demand Projections - Demand": "demand"})
-len(df_filtered_sd)
-
-# reshape to long format for plotting
-df_filtered_sd = df_filtered_sd.melt(id_vars=["year", "Profession"], var_name="type", value_name="value")
-len(df_filtered_sd)
-df_filtered_sd.head()
-
-fig = px.line(df_filtered_sd, x="year", y="value", color="Profession", line_dash = 'type')
-plot(fig, filename='dis_agg_check.html')
-# Yep, looks good 
+plot(fig, filename="percent_adequacy_all_professions.html")
